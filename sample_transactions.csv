@@ -1,0 +1,78 @@
+transaction_id,customer_id,date,amount,counterparty_country,transaction_type,customer_risk_profile
+TXN0001,CUST011,2026-06-08 00:00,2979.12,South Africa,cash_deposit,Low
+TXN0002,CUST002,2026-07-14 23:00,3574.11,Zimbabwe,online_transfer,Low
+TXN0003,CUST001,2026-06-06 06:00,969.01,USA,wire_transfer,Low
+TXN0004,CUST012,2026-07-12 22:00,2202.52,South Africa,cheque,Low
+TXN0005,CUST013,2026-07-26 00:00,3047.29,South Africa,cheque,Low
+TXN0006,CUST003,2026-06-14 10:00,453.73,UK,wire_transfer,Low
+TXN0007,CUST006,2026-07-09 08:00,3238.16,UK,online_transfer,Low
+TXN0008,CUST015,2026-06-25 02:00,2230.56,USA,mobile_money,Low
+TXN0009,CUST012,2026-06-05 01:00,2661.99,Botswana,wire_transfer,Medium
+TXN0010,CUST014,2026-06-07 12:00,1148.0,Botswana,cash_deposit,Low
+TXN0011,CUST004,2026-07-13 08:00,2822.19,Zimbabwe,online_transfer,Medium
+TXN0012,CUST009,2026-07-17 07:00,695.44,UK,mobile_money,High
+TXN0013,CUST011,2026-07-15 17:00,917.48,Botswana,wire_transfer,Low
+TXN0014,CUST001,2026-07-22 10:00,1634.6,Zimbabwe,cash_deposit,High
+TXN0015,CUST010,2026-07-27 22:00,1292.98,UK,cheque,Medium
+TXN0016,CUST011,2026-06-30 04:00,1096.28,South Africa,online_transfer,Low
+TXN0017,CUST012,2026-07-08 13:00,3596.4,UK,mobile_money,Low
+TXN0018,CUST003,2026-07-03 15:00,409.09,Zimbabwe,wire_transfer,Low
+TXN0019,CUST003,2026-07-21 21:00,1717.53,Zimbabwe,cheque,Low
+TXN0020,CUST008,2026-07-04 08:00,3885.76,Zimbabwe,wire_transfer,Medium
+TXN0021,CUST009,2026-07-19 08:00,3085.96,Botswana,wire_transfer,Low
+TXN0022,CUST003,2026-06-30 00:00,3817.57,Botswana,online_transfer,Medium
+TXN0023,CUST009,2026-07-29 03:00,3488.55,Botswana,online_transfer,Medium
+TXN0024,CUST003,2026-06-24 05:00,2180.55,USA,wire_transfer,Low
+TXN0025,CUST008,2026-06-02 03:00,3719.94,Botswana,cash_deposit,Low
+TXN0026,CUST015,2026-07-07 02:00,388.33,UK,wire_transfer,High
+TXN0027,CUST009,2026-07-20 04:00,557.15,UK,online_transfer,Low
+TXN0028,CUST009,2026-07-26 19:00,1721.39,South Africa,online_transfer,Medium
+TXN0029,CUST012,2026-06-13 22:00,1281.28,Botswana,cheque,Medium
+TXN0030,CUST008,2026-06-08 07:00,937.55,Botswana,wire_transfer,Low
+TXN0031,CUST004,2026-07-08 07:00,78.4,Zimbabwe,cash_deposit,Low
+TXN0032,CUST001,2026-07-26 10:00,329.89,South Africa,mobile_money,Medium
+TXN0033,CUST004,2026-07-05 04:00,2907.24,USA,online_transfer,Low
+TXN0034,CUST013,2026-07-01 13:00,802.12,Zimbabwe,cheque,Low
+TXN0035,CUST007,2026-06-30 23:00,263.98,Zimbabwe,wire_transfer,Low
+TXN0036,CUST006,2026-07-22 03:00,1032.19,South Africa,online_transfer,Low
+TXN0037,CUST007,2026-06-12 08:00,1877.38,Zimbabwe,cheque,Medium
+TXN0038,CUST014,2026-07-06 03:00,249.82,USA,wire_transfer,High
+TXN0039,CUST015,2026-07-19 07:00,706.93,UK,cheque,Low
+TXN0040,CUST007,2026-07-28 01:00,700.32,Zimbabwe,cheque,Low
+TXN0041,CUST013,2026-07-21 14:00,1176.73,USA,cheque,Low
+TXN0042,CUST005,2026-06-14 01:00,2337.76,USA,wire_transfer,Medium
+TXN0043,CUST001,2026-06-04 18:00,1933.31,USA,cash_deposit,Low
+TXN0044,CUST009,2026-06-06 05:00,320.66,Zimbabwe,cash_deposit,Low
+TXN0045,CUST015,2026-07-07 07:00,2336.73,Zimbabwe,online_transfer,Low
+TXN0046,CUST011,2026-07-08 18:00,2114.99,Botswana,cash_deposit,Medium
+TXN0047,CUST006,2026-06-16 08:00,1613.35,Botswana,cheque,Low
+TXN0048,CUST013,2026-07-30 02:00,86.8,USA,online_transfer,High
+TXN0049,CUST002,2026-07-05 06:00,2048.24,South Africa,mobile_money,Medium
+TXN0050,CUST015,2026-06-16 11:00,1175.7,UK,online_transfer,Medium
+TXN0051,CUST010,2026-07-22 20:00,2139.32,USA,mobile_money,High
+TXN0052,CUST002,2026-07-31 04:00,1094.64,Zimbabwe,online_transfer,Low
+TXN0053,CUST005,2026-07-09 06:00,2884.57,South Africa,mobile_money,Low
+TXN0054,CUST005,2026-07-28 01:00,414.58,UK,mobile_money,Low
+TXN0055,CUST006,2026-07-20 04:00,2566.6,Botswana,cash_deposit,Medium
+TXN0056,CUST009,2026-07-16 13:00,2265.58,Zimbabwe,wire_transfer,High
+TXN0057,CUST012,2026-07-28 04:00,2205.08,Botswana,online_transfer,Low
+TXN0058,CUST007,2026-06-09 01:00,1267.62,Zimbabwe,mobile_money,Low
+TXN0059,CUST004,2026-07-13 03:00,1447.03,USA,cheque,High
+TXN0060,CUST012,2026-06-10 07:00,3465.19,South Africa,cheque,Low
+TXN0061,CUST005,2026-06-21 00:00,9641.94,Zimbabwe,cash_deposit,Medium
+TXN0062,CUST005,2026-06-22 00:00,9399.31,Zimbabwe,cash_deposit,Medium
+TXN0063,CUST005,2026-06-23 00:00,9758.49,Zimbabwe,cash_deposit,Medium
+TXN0064,CUST005,2026-06-24 00:00,9681.34,Zimbabwe,cash_deposit,Medium
+TXN0065,CUST009,2026-07-01 00:00,15000.0,Iran,wire_transfer,High
+TXN0066,CUST012,2026-07-06 00:00,22000.0,Myanmar,wire_transfer,Medium
+TXN0067,CUST002,2026-07-11 00:00,2728.13,South Africa,mobile_money,Low
+TXN0068,CUST002,2026-07-11 03:00,2621.5,South Africa,mobile_money,Low
+TXN0069,CUST002,2026-07-11 06:00,1533.61,South Africa,mobile_money,Low
+TXN0070,CUST002,2026-07-11 09:00,2574.75,South Africa,mobile_money,Low
+TXN0071,CUST007,2026-07-16 00:00,20000.0,UAE,wire_transfer,Low
+TXN0072,CUST003,2026-06-01 00:00,121.62,Zimbabwe,mobile_money,Low
+TXN0073,CUST003,2026-06-03 00:00,274.43,Zimbabwe,mobile_money,Low
+TXN0074,CUST003,2026-06-05 00:00,271.72,Zimbabwe,mobile_money,Low
+TXN0075,CUST003,2026-06-07 00:00,144.49,Zimbabwe,mobile_money,Low
+TXN0076,CUST003,2026-06-09 00:00,263.32,Zimbabwe,mobile_money,Low
+TXN0077,CUST003,2026-07-26 00:00,8000.0,Zimbabwe,wire_transfer,Low
