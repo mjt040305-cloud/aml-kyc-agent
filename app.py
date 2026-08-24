@@ -77,11 +77,15 @@ required_cols = {
     "counterparty_country", "transaction_type", "customer_risk_profile"
 }
 
-raw_df = None
+if "raw_df" not in st.session_state:
+    st.session_state.raw_df = None
+
 if uploaded_file is not None:
-    raw_df = pd.read_csv(uploaded_file)
+    st.session_state.raw_df = pd.read_csv(uploaded_file)
 elif use_sample:
-    raw_df = pd.read_csv("sample_transactions.csv")
+    st.session_state.raw_df = pd.read_csv("sample_transactions.csv")
+
+raw_df = st.session_state.raw_df
 
 if raw_df is not None:
     missing = required_cols - set(raw_df.columns)
