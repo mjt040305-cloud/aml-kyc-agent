@@ -21,17 +21,17 @@ class ComplianceReportPDF(FPDF):
     def header(self):
         self.set_font("Helvetica", "B", 14)
         self.set_text_color(*NAVY)
-        self.cell(0, 10, "AML/KYC Compliance Report", ln=True, align="C")
+        self.multi_cell(0, 10, "AML/KYC Compliance Report", align="C")
         self.set_font("Helvetica", "", 9)
         self.set_text_color(90, 90, 90)
-        self.cell(0, 6, f"Generated {datetime.now().strftime('%Y-%m-%d %H:%M')} - Educational prototype, simulated data only", ln=True, align="C")
+        self.multi_cell(0, 6, f"Generated {datetime.now().strftime('%Y-%m-%d %H:%M')} - Educational prototype, simulated data only", align="C")
         self.ln(4)
 
     def footer(self):
         self.set_y(-15)
         self.set_font("Helvetica", "I", 8)
         self.set_text_color(120, 120, 120)
-        self.cell(0, 10, f"Page {self.page_no()}", align="C")
+        self.multi_cell(0, 10, f"Page {self.page_no()}", align="C")
 
 
 def _safe(text) -> str:
@@ -57,7 +57,7 @@ def build_pdf(final_report: list, rules_config: dict, output_path: str):
     # ---------------- Executive summary ----------------
     pdf.set_font("Helvetica", "B", 11)
     pdf.set_text_color(0, 0, 0)
-    pdf.cell(0, 8, "Executive Summary", ln=True)
+    pdf.multi_cell(0, 8, "Executive Summary")
     pdf.set_font("Helvetica", "", 10)
     summary_lines = [
         f"Total transactions analysed: {total}",
@@ -66,12 +66,12 @@ def build_pdf(final_report: list, rules_config: dict, output_path: str):
         f"Transactions escalated to SAR filing: {escalated}",
     ]
     for line in summary_lines:
-        pdf.cell(0, 6, _safe(line), ln=True)
+        pdf.multi_cell(0, 6, _safe(line))
     pdf.ln(4)
 
     # ---------------- Rule configuration used ----------------
     pdf.set_font("Helvetica", "B", 11)
-    pdf.cell(0, 8, "AML Rule Configuration Applied", ln=True)
+    pdf.multi_cell(0, 8, "AML Rule Configuration Applied")
     pdf.set_font("Helvetica", "", 9)
     cfg_lines = [
         f"Structuring threshold: ${rules_config.get('structuring_threshold', 10000):,.0f} (margin {rules_config.get('structuring_margin', 0.10)*100:.0f}%)",
@@ -85,7 +85,7 @@ def build_pdf(final_report: list, rules_config: dict, output_path: str):
 
     # ---------------- Flagged transaction table ----------------
     pdf.set_font("Helvetica", "B", 11)
-    pdf.cell(0, 8, "Flagged Transactions (Medium/High Risk)", ln=True)
+    pdf.multi_cell(0, 8, "Flagged Transactions (Medium/High Risk)")
 
     col_widths = [22, 22, 22, 30, 16, 60, 40, 30]
     headers = ["Txn ID", "Customer", "Amount", "Date", "Score", "Flag Reasons", "Decision", "Reviewer"]
