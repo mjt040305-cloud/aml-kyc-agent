@@ -38,6 +38,7 @@ from agent_graph import build_agent_graph, run_pipeline, resume_pipeline
 from rules_engine import SEVERITY_ICON, CATEGORIES, DEFAULT_CONFIG
 from pdf_report import build_pdf
 from currency import CURRENCY_OPTIONS, format_amount
+import regulatory_watch
 
 st.set_page_config(page_title="AML/KYC Compliance Agent", page_icon="\U0001F6E1\uFE0F", layout="wide")
 
@@ -154,6 +155,42 @@ with st.expander("\u2139\uFE0F Agent architecture (click to expand)"):
     No transaction is ever auto-reported - the graph structurally cannot
     reach `output` for a flagged transaction without a human decision.
     """)
+
+with st.expander("\U0001F4DC AML/CFT Regulatory Guidelines (Zimbabwe)"):
+    st.caption(
+        "The rules in this agent are grounded in Zimbabwe's AML/CFT regulatory "
+        "framework, summarised below. This is informational context, not legal "
+        "advice - always consult the source documents and your institution's "
+        "compliance officer."
+    )
+    for item in regulatory_watch.STATIC_FRAMEWORK:
+        with st.container(border=True):
+            title_line = f"**{item['title']}**  \u2014  *{item['role']}*"
+            st.markdown(title_line)
+            st.caption(item["note"])
+            if item.get("url"):
+                st.markdown(f"[Source document]({item['url']})")
+
+    st.divider()
+    st.markdown("**Live check: Reserve Bank of Zimbabwe guideline list**")
+    st.caption(
+        f"Bundled snapshot last taken {regulatory_watch.SNAPSHOT_DATE}. "
+        "This checks whether the RBZ has published new/renamed guidelines since then - "
+        "it does not read or summarise their content."
+    )
+    if st.button("\U0001F504 Check RBZ site for updates now"):
+        with st.spinner("Fetching the live RBZ guidelines page..."):
+            result = regulatory_watch.check_for_updates()
+        if result["status"] == "error":
+            st.warning(f"\u26A0\uFE0F Live check failed: {result['message']} Falling back to the bundled snapshot above.")
+        else:
+            st.success(f"Checked at {result['checked_at']} \u2014 {result['total_found']} guideline documents found on the live RBZ page.")
+            if result["new_or_changed"]:
+                st.warning("\U0001F195 Possibly new or renamed since the bundled snapshot \u2014 review manually:")
+                for title in result["new_or_changed"]:
+                    st.markdown(f"- {title}")
+            else:
+                st.info("No new guideline titles detected since the bundled snapshot.")
 
 # ---------------------------------------------------------------------------
 # STEP 1: READ INPUT

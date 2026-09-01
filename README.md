@@ -95,12 +95,48 @@ aml-agent/
 ├── app.py                          # Streamlit UI - drives the agent graph
 ├── agent_graph.py                  # LangGraph orchestration (analyse -> human_review -> output)
 ├── rules_engine.py                 # Rules + risk-category scoring logic
+├── currency.py                     # Reporting-currency conversion (USD/ZAR/ZiG/GBP/EUR)
+├── regulatory_watch.py             # Zimbabwe AML/CFT framework + live RBZ guideline check
+├── pdf_report.py                   # PDF compliance report generation
 ├── sample_transactions.csv         # Simulated dataset for demo/testing
 ├── requirements.txt
 ├── .streamlit/secrets.toml.example # Template for any future API keys (no real secrets)
 ├── .gitignore
 └── README.md
 ```
+
+## 5a. Zimbabwe AML/CFT regulatory grounding
+
+The rules engine's design is grounded in Zimbabwe's actual AML/CFT
+framework (see `regulatory_watch.py` for full detail and source links):
+
+- **Money Laundering and Proceeds of Crime Act [Chapter 9:24]** - the
+  primary legislation.
+- **AML/CFT/CPF Guideline No: 01-2025/BSSFS (June 2025)** - the RBZ's
+  current governing guideline for banks, requiring a risk-based approach,
+  at-least-annual enterprise-wide risk assessment, and ongoing
+  transaction monitoring - the same principles this agent implements.
+- **Financial Intelligence Unit (FIU) Zimbabwe** - issues binding sector
+  guidelines and receives Suspicious Transaction Reports (STRs).
+- **Statutory Instrument 99 of 2026** - extended AML/CFT oversight to
+  virtual asset service providers (VASPs).
+- **FATF Recommendations** - inform the risk-based approach and
+  high-risk-jurisdiction concept used in this agent's Geographic Risk
+  category.
+
+The app includes an **"AML/CFT Regulatory Guidelines (Zimbabwe)"**
+expander summarising this framework, plus an optional, user-triggered
+**live check** against the RBZ's public Bank Supervision Guidelines page
+(`regulatory_watch.check_for_updates()`). This is a genuine live fetch -
+not a simulation - that compares the guideline titles currently published
+on the RBZ site against a bundled snapshot, flagging anything new or
+renamed for manual review. It never runs automatically, never blocks the
+core agent pipeline, and fails gracefully (with a clear message rather
+than a crash) if the RBZ site is unreachable or its structure changes.
+**This check is informational only** - it detects title changes, it does
+not read, summarise, or interpret legal text, and it is not a substitute
+for the compliance officer's own regulatory monitoring obligations or for
+consulting the source documents directly.
 
 ## 6. Running locally
 
@@ -156,6 +192,14 @@ CSV with these columns:
   runs do not survive an app restart; a production deployment would swap
   this for a persistent checkpointer (e.g. Postgres/SQLite) so paused,
   awaiting-review runs and their audit trail survive restarts.
+- The live RBZ regulatory check depends on the RBZ website's structure
+  and availability. It was built and syntax-tested against the site's
+  actual current markup, but automated fetches from a cloud environment
+  can be blocked by bot-protection measures outside this agent's control;
+  the feature is designed to fail gracefully with a clear message rather
+  than crash if that happens, but a failed live check should not be read
+  as "no regulatory changes" - always verify against the official RBZ/FIU
+  sites directly.
 - Intended as an educational prototype, not a production compliance system.
 
 ## 10. Human oversight checkpoint
