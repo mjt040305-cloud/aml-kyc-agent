@@ -27,6 +27,7 @@ architecture with explainability and auditability built in.
 """
 
 from typing import TypedDict, List, Dict, Any
+from datetime import datetime
 import pandas as pd
 
 from langgraph.graph import StateGraph, START, END
@@ -77,6 +78,8 @@ def node_output(state: AgentState) -> AgentState:
     """Stage 5: merge human decisions into the final, exportable report."""
     reviews = state.get("reviews", {}) or {}
     final = []
+    sar_counter = 1
+    year = datetime.now().year
     for t in state["analysed"]:
         r = reviews.get(t["transaction_id"], {})
         needs_review = t["risk_bucket"] in ("High", "Medium")
@@ -84,6 +87,11 @@ def node_output(state: AgentState) -> AgentState:
         t["review_status"] = r.get("status", "Pending" if needs_review else "Not required")
         t["reviewer_notes"] = r.get("notes", "")
         t["reviewed_by"] = r.get("reviewer", "")
+        if t["review_status"] == "Escalate to SAR filing":
+            t["case_reference"] = f"SAR-{year}-{sar_counter:04d}"
+            sar_counter += 1
+        else:
+            t["case_reference"] = ""
         final.append(t)
     state["final_report"] = final
     return state

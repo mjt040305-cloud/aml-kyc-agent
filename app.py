@@ -19,7 +19,9 @@ LangGraph state graph (see agent_graph.py):
                 supplies a timestamped decision for every Medium/High risk
                 transaction
   5. OUTPUT  -> the graph resumes and produces a reviewed, exportable
-                compliance report (CSV + PDF) plus a timestamped audit trail
+                compliance report (CSV + Excel + PDF) plus a timestamped
+                audit trail, SAR case reference numbers, and a configurable
+                reporting currency (USD/ZAR/ZiG/GBP/EUR)
 
 Run locally with:  streamlit run app.py
 """
@@ -30,10 +32,12 @@ from datetime import datetime
 import uuid
 import tempfile
 import os
+from io import BytesIO
 
 from agent_graph import build_agent_graph, run_pipeline, resume_pipeline
 from rules_engine import SEVERITY_ICON, CATEGORIES, DEFAULT_CONFIG
 from pdf_report import build_pdf
+from currency import CURRENCY_OPTIONS, format_amount
 
 st.set_page_config(page_title="AML/KYC Compliance Agent", page_icon="\U0001F6E1\uFE0F", layout="wide")
 
@@ -48,6 +52,8 @@ defaults = {
     "final_report": None,
     "rules_config": dict(DEFAULT_CONFIG),
     "audit_trail": [],                # list of {transaction_id, status, reviewer, notes, reviewed_at}
+    "currency_code": "USD",
+    "fx_rate": 1.0,
 }
 for k, v in defaults.items():
     if k not in st.session_state:
@@ -100,6 +106,25 @@ with st.sidebar:
     }
 
     st.caption("Changes apply the next time you click **Run compliance analysis**.")
+
+    st.divider()
+    st.header("\U0001F4B1 Reporting Currency")
+    st.caption("Transaction data is recorded in USD. AML thresholds are always evaluated in USD - this only changes how amounts are *displayed*.")
+
+    currency_code = st.selectbox(
+        "Currency", options=list(CURRENCY_OPTIONS.keys()),
+        format_func=lambda c: f"{c} \u2014 {CURRENCY_OPTIONS[c]['name']}",
+        index=list(CURRENCY_OPTIONS.keys()).index(st.session_state.currency_code),
+    )
+    default_rate = CURRENCY_OPTIONS[currency_code]["default_rate"]
+    fx_rate = st.number_input(
+        f"Exchange rate (1 USD = ? {currency_code})",
+        min_value=0.0001, value=float(default_rate), step=0.01, format="%.4f",
+    )
+    st.caption("\u26A0\uFE0F Officer-entered rate for this session only \u2014 not a live FX feed. Verify against your institution's official rate before filing.")
+
+    st.session_state.currency_code = currency_code
+    st.session_state.fx_rate = fx_rate
 
 st.title("\U0001F6E1\uFE0F AML/KYC Compliance Flagging Agent")
 st.caption(
@@ -202,13 +227,16 @@ def render_risk_breakdown(txn):
 
 def render_dashboard(all_txns):
     """Executive KPI cards + charts summarising the whole flagged population."""
+    currency_code = st.session_state.currency_code
+    fx_rate = st.session_state.fx_rate
+
     flagged = [t for t in all_txns if t["risk_bucket"] in ("High", "Medium")]
     flagged_amount = sum(t["amount"] for t in flagged)
     avg_score = (sum(t["risk_score"] for t in flagged) / len(flagged)) if flagged else 0
     pct_review = (len(flagged) / len(all_txns) * 100) if all_txns else 0
 
     k1, k2, k3 = st.columns(3)
-    k1.metric("Total value flagged", f"${flagged_amount:,.0f}")
+    k1.metric(f"Total value flagged ({currency_code})", format_amount(flagged_amount, currency_code, fx_rate))
     k2.metric("Avg. score (flagged)", f"{avg_score:.0f}")
     k3.metric("% requiring review", f"{pct_review:.0f}%")
 
@@ -275,7 +303,8 @@ if st.session_state.pipeline_status in ("awaiting_review", "complete"):
             with st.container(border=True):
                 st.markdown(
                     f"{badge} **{txn['transaction_id']}** \u2014 Customer `{txn['customer_id']}` \u2014 "
-                    f"${txn['amount']:,.2f} \u2014 {txn['date']} \u2014 **Overall risk score: {txn['risk_score']}**"
+                    f"{format_amount(txn['amount'], st.session_state.currency_code, st.session_state.fx_rate)} "
+                    f"\u2014 {txn['date']} \u2014 **Overall risk score: {txn['risk_score']}**"
                 )
                 render_risk_breakdown(txn)
 
@@ -318,15 +347,47 @@ if st.session_state.pipeline_status in ("awaiting_review", "complete"):
         st.header("Step 5: Output - Compliance report")
         st.success("\u2705 Agent graph reached the output node \u2014 all flagged transactions have a recorded human decision.")
 
+        currency_code = st.session_state.currency_code
+        fx_rate = st.session_state.fx_rate
+
         report_df = pd.DataFrame(st.session_state.final_report)
-        display_cols = ["transaction_id", "customer_id", "amount", "date", "risk_bucket",
-                         "risk_score", "flag_reasons", "review_status", "reviewed_by", "reviewer_notes"]
-        st.dataframe(report_df[display_cols], use_container_width=True)
+        report_df[f"amount_{currency_code}"] = report_df["amount"] * fx_rate
+        if "case_reference" not in report_df.columns:
+            report_df["case_reference"] = ""
+
+        display_cols = ["transaction_id", "customer_id", "amount", f"amount_{currency_code}", "date",
+                         "risk_bucket", "risk_score", "case_reference", "flag_reasons",
+                         "review_status", "reviewed_by", "reviewer_notes"]
+        st.dataframe(
+            report_df[display_cols].rename(columns={"amount": "amount_USD"}),
+            use_container_width=True
+        )
+        st.caption(f"amount_USD is the original recorded value; amount_{currency_code} is converted at your sidebar rate (1 USD = {fx_rate:.4f} {currency_code}).")
 
         with st.expander("View full risk breakdown for a transaction"):
             txn_id = st.selectbox("Select transaction", report_df["transaction_id"].tolist())
             selected = next(t for t in st.session_state.final_report if t["transaction_id"] == txn_id)
             render_risk_breakdown(selected)
+
+        with st.expander("\U0001F50D Customer transaction history"):
+            customer_ids = sorted(report_df["customer_id"].unique().tolist())
+            selected_customer = st.selectbox("Select customer", customer_ids)
+            cust_df = report_df[report_df["customer_id"] == selected_customer].sort_values("date")
+            st.dataframe(
+                cust_df[["transaction_id", "date", "amount", f"amount_{currency_code}", "risk_bucket", "risk_score", "review_status"]],
+                use_container_width=True
+            )
+            if len(cust_df) > 1:
+                chart_df = cust_df[["date", "amount", "risk_score"]].set_index("date")
+                c1, c2 = st.columns(2)
+                with c1:
+                    st.caption("Transaction amounts over time (USD)")
+                    st.line_chart(chart_df["amount"])
+                with c2:
+                    st.caption("Risk score over time")
+                    st.line_chart(chart_df["risk_score"])
+            else:
+                st.caption("Only one transaction on record for this customer.")
 
         if st.session_state.audit_trail:
             with st.expander("\U0001F4CB Timestamped audit trail"):
@@ -339,25 +400,47 @@ if st.session_state.pipeline_status in ("awaiting_review", "complete"):
                     mime="text/csv",
                 )
 
-        dl1, dl2 = st.columns(2)
+        dl1, dl2, dl3 = st.columns(3)
         with dl1:
-            csv_out = report_df[display_cols + ["category_scores"]].to_csv(index=False).encode("utf-8")
+            csv_out = report_df[display_cols + ["category_scores"]].rename(columns={"amount": "amount_USD"}).to_csv(index=False).encode("utf-8")
             st.download_button(
-                "\u2B07 Download compliance report (CSV)",
+                "\u2B07 Download report (CSV)",
                 data=csv_out,
                 file_name=f"aml_compliance_report_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
                 mime="text/csv",
                 type="primary"
             )
         with dl2:
+            if st.button("\U0001F4CA Generate Excel report"):
+                with st.spinner("Building Excel workbook..."):
+                    excel_buf = BytesIO()
+                    with pd.ExcelWriter(excel_buf, engine="openpyxl") as writer:
+                        report_df[display_cols].rename(columns={"amount": "amount_USD"}).to_excel(
+                            writer, sheet_name="Compliance Report", index=False
+                        )
+                        if st.session_state.audit_trail:
+                            pd.DataFrame(st.session_state.audit_trail).to_excel(
+                                writer, sheet_name="Audit Trail", index=False
+                            )
+                    excel_bytes = excel_buf.getvalue()
+                st.download_button(
+                    "\u2B07 Download report (Excel)",
+                    data=excel_bytes,
+                    file_name=f"aml_compliance_report_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                )
+        with dl3:
             if st.button("\U0001F4C4 Generate PDF report"):
                 with st.spinner("Building PDF..."):
                     tmp_path = os.path.join(tempfile.gettempdir(), "aml_compliance_report.pdf")
-                    build_pdf(st.session_state.final_report, st.session_state.rules_config, tmp_path)
+                    build_pdf(
+                        st.session_state.final_report, st.session_state.rules_config, tmp_path,
+                        currency_code=currency_code, fx_rate=fx_rate,
+                    )
                     with open(tmp_path, "rb") as f:
                         pdf_bytes = f.read()
                 st.download_button(
-                    "\u2B07 Download compliance report (PDF)",
+                    "\u2B07 Download report (PDF)",
                     data=pdf_bytes,
                     file_name=f"aml_compliance_report_{datetime.now().strftime('%Y%m%d_%H%M')}.pdf",
                     mime="application/pdf",

@@ -16,6 +16,20 @@ from fpdf import FPDF
 NAVY = (31, 56, 100)
 LIGHTGREY = (240, 240, 240)
 
+# fpdf2's default core font (Helvetica) only supports latin-1 characters.
+# The Euro sign (\u20AC) and a few others fall outside latin-1, so this
+# module uses ASCII-safe currency prefixes here even though the Streamlit
+# UI itself can display the real symbols (currency.py) without issue.
+PDF_SAFE_SYMBOL = {
+    "USD": "$", "ZAR": "R", "ZWG": "ZiG ", "GBP": "GBP ", "EUR": "EUR ",
+}
+
+
+def _pdf_format_amount(amount_usd: float, currency_code: str, rate: float) -> str:
+    symbol = PDF_SAFE_SYMBOL.get(currency_code, "$")
+    converted = amount_usd * rate
+    return f"{symbol}{converted:,.2f}"
+
 
 class ComplianceReportPDF(FPDF):
     def header(self):
@@ -39,10 +53,14 @@ def _safe(text) -> str:
     return str(text).encode("latin-1", "ignore").decode("latin-1")
 
 
-def build_pdf(final_report: list, rules_config: dict, output_path: str):
+def build_pdf(final_report: list, rules_config: dict, output_path: str,
+              currency_code: str = "USD", fx_rate: float = 1.0):
     """
     final_report: list of transaction dicts (as produced by agent_graph output)
     rules_config: the AML thresholds used for this run (for audit purposes)
+    currency_code / fx_rate: reporting currency for displayed amounts.
+        Underlying transaction data and AML thresholds are always USD;
+        this only affects how amounts are printed in the PDF.
     """
     pdf = ComplianceReportPDF(orientation="L", unit="mm", format="A4")
     pdf.set_auto_page_break(auto=True, margin=15)
@@ -51,7 +69,7 @@ def build_pdf(final_report: list, rules_config: dict, output_path: str):
     total = len(final_report)
     high = sum(1 for t in final_report if t["risk_bucket"] == "High")
     medium = sum(1 for t in final_report if t["risk_bucket"] == "Medium")
-    flagged_amount = sum(t["amount"] for t in final_report if t["risk_bucket"] in ("High", "Medium"))
+    flagged_amount_usd = sum(t["amount"] for t in final_report if t["risk_bucket"] in ("High", "Medium"))
     escalated = sum(1 for t in final_report if t.get("review_status") == "Escalate to SAR filing")
 
     # ---------------- Executive summary ----------------
@@ -62,7 +80,7 @@ def build_pdf(final_report: list, rules_config: dict, output_path: str):
     summary_lines = [
         f"Total transactions analysed: {total}",
         f"High risk: {high}   |   Medium risk: {medium}",
-        f"Total value of flagged transactions: ${flagged_amount:,.2f}",
+        f"Total value of flagged transactions: {_pdf_format_amount(flagged_amount_usd, currency_code, fx_rate)} ({currency_code})",
         f"Transactions escalated to SAR filing: {escalated}",
     ]
     for line in summary_lines:
@@ -74,7 +92,8 @@ def build_pdf(final_report: list, rules_config: dict, output_path: str):
     pdf.multi_cell(0, 8, "AML Rule Configuration Applied")
     pdf.set_font("Helvetica", "", 9)
     cfg_lines = [
-        f"Structuring threshold: ${rules_config.get('structuring_threshold', 10000):,.0f} (margin {rules_config.get('structuring_margin', 0.10)*100:.0f}%)",
+        f"Reporting currency: {currency_code} (1 USD = {fx_rate:.4f} {currency_code}, officer-entered rate, not a live feed)",
+        f"Structuring threshold: {_pdf_format_amount(rules_config.get('structuring_threshold', 10000), currency_code, fx_rate)} (margin {rules_config.get('structuring_margin', 0.10)*100:.0f}%)",
         f"High-risk countries: {', '.join(rules_config.get('high_risk_countries', []))}",
         f"Rapid movement: {rules_config.get('rapid_movement_min_txns', 3)}+ txns within {rules_config.get('rapid_movement_hours', 24)}h",
         f"Velocity deviation threshold: {rules_config.get('velocity_std_multiplier', 3)} standard deviations",
@@ -87,8 +106,8 @@ def build_pdf(final_report: list, rules_config: dict, output_path: str):
     pdf.set_font("Helvetica", "B", 11)
     pdf.multi_cell(0, 8, "Flagged Transactions (Medium/High Risk)")
 
-    col_widths = [22, 22, 22, 30, 16, 60, 40, 30]
-    headers = ["Txn ID", "Customer", "Amount", "Date", "Score", "Flag Reasons", "Decision", "Reviewer"]
+    col_widths = [20, 20, 24, 26, 14, 22, 50, 34, 26]
+    headers = ["Txn ID", "Customer", "Amount", "Date", "Score", "Case Ref.", "Flag Reasons", "Decision", "Reviewer"]
 
     pdf.set_font("Helvetica", "B", 8)
     pdf.set_fill_color(*NAVY)
@@ -106,20 +125,19 @@ def build_pdf(final_report: list, rules_config: dict, output_path: str):
         pdf.set_fill_color(*(LIGHTGREY if row_fill else (255, 255, 255)))
         row_fill = not row_fill
 
-        y_before = pdf.get_y()
-        x_before = pdf.get_x()
-
         values = [
-            t["transaction_id"], t["customer_id"], f"${t['amount']:,.0f}",
+            t["transaction_id"], t["customer_id"],
+            _pdf_format_amount(t["amount"], currency_code, fx_rate),
             str(t["date"])[:10], str(t["risk_score"]),
+            t.get("case_reference", "") or "-",
         ]
-        for w, v in zip(col_widths[:5], values):
+        for w, v in zip(col_widths[:6], values):
             pdf.cell(w, 6, _safe(v), border=1, fill=True)
 
         # Flag reasons + decision + reviewer as multi-line-safe truncated cells
-        pdf.cell(col_widths[5], 6, _safe(t.get("flag_reasons", ""))[:70], border=1, fill=True)
-        pdf.cell(col_widths[6], 6, _safe(t.get("review_status", ""))[:35], border=1, fill=True)
-        pdf.cell(col_widths[7], 6, _safe(t.get("reviewed_by", ""))[:25], border=1, fill=True)
+        pdf.cell(col_widths[6], 6, _safe(t.get("flag_reasons", ""))[:55], border=1, fill=True)
+        pdf.cell(col_widths[7], 6, _safe(t.get("review_status", ""))[:32], border=1, fill=True)
+        pdf.cell(col_widths[8], 6, _safe(t.get("reviewed_by", ""))[:22], border=1, fill=True)
         pdf.ln()
 
     pdf.output(output_path)
