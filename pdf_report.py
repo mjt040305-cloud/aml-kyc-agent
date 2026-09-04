@@ -21,7 +21,7 @@ LIGHTGREY = (240, 240, 240)
 # module uses ASCII-safe currency prefixes here even though the Streamlit
 # UI itself can display the real symbols (currency.py) without issue.
 PDF_SAFE_SYMBOL = {
-    "USD": "$", "ZAR": "R", "ZWG": "ZiG ", "GBP": "GBP ", "EUR": "EUR ",
+    "USD": "$", "ZAR": "R", "ZWG": "ZiG ",
 }
 
 

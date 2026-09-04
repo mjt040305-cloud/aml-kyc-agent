@@ -21,7 +21,7 @@ LangGraph state graph (see agent_graph.py):
   5. OUTPUT  -> the graph resumes and produces a reviewed, exportable
                 compliance report (CSV + Excel + PDF) plus a timestamped
                 audit trail, SAR case reference numbers, and a configurable
-                reporting currency (USD/ZAR/ZiG/GBP/EUR)
+                reporting currency (USD/ZAR/ZiG)
 
 Run locally with:  streamlit run app.py
 """
@@ -55,6 +55,8 @@ defaults = {
     "audit_trail": [],                # list of {transaction_id, status, reviewer, notes, reviewed_at}
     "currency_code": "USD",
     "fx_rate": 1.0,
+    "analysis_currency_code": None,   # currency active at the moment analysis was last run
+    "analysis_fx_rate": None,
 }
 for k, v in defaults.items():
     if k not in st.session_state:
@@ -172,11 +174,22 @@ with st.expander("\U0001F4DC AML/CFT Regulatory Guidelines (Zimbabwe)"):
                 st.markdown(f"[Source document]({item['url']})")
 
     st.divider()
+    st.markdown("**FIU Zimbabwe sector-specific guidelines**")
+    st.caption(
+        f"Catalogued manually as of {regulatory_watch.FIU_SECTOR_GUIDELINES_DATE} "
+        "(FIU's site has shown intermittent availability, so this list is not "
+        "live-checked - confirm directly at fiu.co.zw/index.php/guidelines/ before filing)."
+    )
+    for title in regulatory_watch.FIU_SECTOR_GUIDELINES:
+        st.markdown(f"- {title}")
+
+    st.divider()
     st.markdown("**Live check: Reserve Bank of Zimbabwe guideline list**")
     st.caption(
         f"Bundled snapshot last taken {regulatory_watch.SNAPSHOT_DATE}. "
         "This checks whether the RBZ has published new/renamed guidelines since then - "
-        "it does not read or summarise their content."
+        "it does not read or summarise their content, and it only covers the RBZ's own "
+        "guideline page (not FIU's, above)."
     )
     if st.button("\U0001F504 Check RBZ site for updates now"):
         with st.spinner("Fetching the live RBZ guidelines page..."):
@@ -227,6 +240,8 @@ if raw_df is not None:
             with st.spinner("Agent analysing transactions across four risk categories..."):
                 st.session_state.thread_id = str(uuid.uuid4())  # fresh run each time
                 st.session_state.audit_trail = []
+                st.session_state.analysis_currency_code = st.session_state.currency_code
+                st.session_state.analysis_fx_rate = st.session_state.fx_rate
                 result = run_pipeline(
                     graph, raw_df.to_dict("records"), st.session_state.thread_id,
                     rules_config=st.session_state.rules_config
@@ -316,6 +331,18 @@ if st.session_state.pipeline_status in ("awaiting_review", "complete"):
     med = sum(1 for t in all_txns if t["risk_bucket"] == "Medium")
 
     st.header("Step 2-3: Agent risk analysis")
+
+    if (st.session_state.analysis_currency_code is not None
+            and st.session_state.analysis_currency_code != st.session_state.currency_code):
+        st.warning(
+            f"\U0001F4B1 Currency switched mid-session: analysis was run with "
+            f"**{st.session_state.analysis_currency_code}** (1 USD = {st.session_state.analysis_fx_rate:.4f} "
+            f"{st.session_state.analysis_currency_code}), but the sidebar is now set to "
+            f"**{st.session_state.currency_code}** (1 USD = {st.session_state.fx_rate:.4f} {st.session_state.currency_code}). "
+            "All amounts below are being redisplayed in the *new* currency \u2014 this is display-only and does not "
+            "change which transactions were flagged, since AML thresholds are always evaluated in USD."
+        )
+
     m1, m2, m3 = st.columns(3)
     m1.metric("Total transactions", total)
     m2.metric("\U0001F534 High risk", high)

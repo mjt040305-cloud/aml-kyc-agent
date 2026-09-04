@@ -10,18 +10,22 @@ and it never blocks or breaks the core agent pipeline if the fetch fails
 (network restrictions, site downtime, or a changed page structure are all
 handled gracefully with a clear message, not a crash).
 
-Zimbabwe's AML/CFT framework (verified via RBZ's own site, Aug 2026):
-  - Legal basis: Money Laundering and Proceeds of Crime Act [Chapter 9:24]
-    ("MLPC Act")
+Zimbabwe's AML/CFT framework (verified against RBZ's and FIU's own sites,
+confirmed current as of September 2026):
+  - Primary legislation: Money Laundering and Proceeds of Crime Act
+    [Chapter 9:24], Bank Use Promotion Act [Chapter 24:24], Suppression of
+    Foreign and International Terrorism Act [Chapter 11:21]
   - Regulator: Reserve Bank of Zimbabwe (RBZ), Bank Supervision Division
   - Financial Intelligence Unit (FIU Zimbabwe): receives Suspicious
     Transaction Reports (STRs) and issues binding sector guidelines
   - Current governing guideline: AML/CFT/CPF Guideline No: 01-2025/BSSFS
-    (June 2025), which requires a risk-based approach, at least annual
-    enterprise-wide risk assessment, and ongoing customer/transaction
-    monitoring - directly mirrored by this agent's rules engine
+    (June 2025) - confirmed still current, no newer AML/CFT guideline has
+    superseded it as of September 2026. Requires a risk-based approach, at
+    least annual enterprise-wide risk assessment, and ongoing
+    customer/transaction monitoring
   - FATF Recommendations and FATF's high-risk/grey-list jurisdictions
-    inform the risk-based approach the RBZ guideline requires
+    inform the risk-based approach the RBZ guideline requires; Zimbabwe
+    itself exited the FATF grey list in 2022
   - Statutory Instrument 99 of 2026 extended AML/CFT oversight to virtual
     asset service providers (VASPs), requiring registration with the RBZ
 
@@ -75,13 +79,37 @@ STATIC_FRAMEWORK = [
     {
         "title": "Money Laundering and Proceeds of Crime Act [Chapter 9:24]",
         "role": "Primary legislation",
-        "note": "Legal basis for AML/CFT obligations in Zimbabwe; RBZ and FIU guidelines are issued under this Act.",
+        "note": "Legal basis for AML/CFT obligations in Zimbabwe; sets out obligations of financial institutions and DNFBPs, criminalises money laundering and terrorist financing, and implements UNSCR 1267 (1999) and UNSCR 1373 (2001).",
+        "url": None,
+    },
+    {
+        "title": "Bank Use Promotion Act [Chapter 24:24]",
+        "role": "Primary legislation",
+        "note": "Part of Zimbabwe's core AML/CFT legal framework alongside the MLPC Act, per the FIU's own published legal framework summary.",
+        "url": None,
+    },
+    {
+        "title": "Suppression of Foreign and International Terrorism Act [Chapter 11:21]",
+        "role": "Primary legislation",
+        "note": "Criminalises terrorist financing and gives domestic effect to UN Security Council Resolutions on terrorism and proliferation financing.",
+        "url": None,
+    },
+    {
+        "title": "Statutory Instrument 76 of 2014 & Statutory Instrument 56 of 2019",
+        "role": "Statutory Instruments",
+        "note": "Implement targeted financial sanctions under UNSCR 1267/1373 (terrorism) and UNSCR 1540 and related resolutions on DPRK/Iran non-state actor proliferation financing.",
+        "url": None,
+    },
+    {
+        "title": "Criminal Law (Codification and Reform) Act [Chapter 9:23] & Criminal Matters (Mutual Legal Assistance) Act [Chapter 9:06]",
+        "role": "Supporting legislation",
+        "note": "Provide the underlying criminal offences and cross-border legal assistance mechanisms that AML/CFT enforcement relies on.",
         "url": None,
     },
     {
         "title": "AML/CFT/CPF Guideline No: 01-2025/BSSFS (June 2025)",
         "role": "RBZ Bank Supervision Guideline",
-        "note": "Current governing guideline for banks/deposit-takers. Requires a risk-based approach, at-least-annual enterprise-wide risk assessment, and ongoing customer/transaction monitoring - the same principles this agent's rules engine implements.",
+        "note": "Current governing guideline for banks/deposit-takers as of September 2026 - confirmed still in force with no newer AML/CFT guideline superseding it. Requires a risk-based approach, at-least-annual enterprise-wide risk assessment, and ongoing customer/transaction monitoring - the same principles this agent's rules engine implements.",
         "url": "https://www.rbz.co.zw/documents/bank_sup/Guidelines_/AML_CFT_CPF_GUIDELINE_-_June_2025.pdf",
     },
     {
@@ -93,7 +121,7 @@ STATIC_FRAMEWORK = [
     {
         "title": "Financial Intelligence Unit (FIU) Zimbabwe Guidelines",
         "role": "Sector guidelines",
-        "note": "FIU issues binding minimum-standard AML/CFT guidelines under the MLPC Act and is the authority that receives Suspicious Transaction Reports (STRs).",
+        "note": "FIU issues binding minimum-standard AML/CFT guidelines under the MLPC Act and is the authority that receives Suspicious Transaction Reports (STRs). See the sector-specific list below.",
         "url": "https://www.fiu.co.zw/index.php/guidelines/",
     },
     {
@@ -105,9 +133,27 @@ STATIC_FRAMEWORK = [
     {
         "title": "FATF Recommendations & high-risk/grey-list jurisdictions",
         "role": "International standard",
-        "note": "The RBZ guideline explicitly incorporates FATF's risk-based approach and high-risk country identification - the basis for this agent's Geographic Risk category.",
+        "note": "The RBZ guideline explicitly incorporates FATF's risk-based approach and high-risk country identification - the basis for this agent's Geographic Risk category. Zimbabwe itself exited the FATF grey list in 2022, following a multi-year FATF/ESAAMLG action plan.",
         "url": None,
     },
+]
+
+# FIU Zimbabwe's sector-specific guideline titles, catalogued manually (as of
+# the date below) rather than live-checked. FIU's own site has shown
+# intermittent availability in testing, so - unlike the RBZ check above -
+# this list is not re-verified automatically; treat it as a starting point
+# and confirm against https://www.fiu.co.zw/index.php/guidelines/ directly.
+FIU_SECTOR_GUIDELINES_DATE = "2026-08-31"
+FIU_SECTOR_GUIDELINES = [
+    "Guidance for Casinos (June 2026)",
+    "Guidelines for Dealers in Precious Metals and Precious Stones (June 2026)",
+    "Guidance for the Real Estate Sector (June 2026)",
+    "Guidelines - Legal Professions (June 2026)",
+    "AML-CFT Guidelines for the Securities Sector",
+    "AML-CFT Guidelines for the Insurance Sector",
+    "AML-CFT Guidelines for Money Transfer Agencies and Bureau de Change",
+    "AML-CFT Guidelines for Financial Institutions (2006)",
+    "AML-CFT Guidelines for Real Estate Sector (Sept 2014, Final)",
 ]
 
 
@@ -144,12 +190,18 @@ def check_for_updates(timeout=8):
         return {"status": "error", "message": f"Could not reach the RBZ guidelines page right now: {e}"}
 
     try:
+        from urllib.parse import urljoin
         matches = re.findall(
-            r'<a[^>]+href="(https://www\.rbz\.co\.zw/documents/[^"]+?\.pdf)"[^>]*>(.*?)</a>',
+            r'<a[^>]+href=["\']([^"\']+?\.pdf)["\'][^>]*>(.*?)</a>',
             html, re.IGNORECASE | re.DOTALL,
         )
         found_titles = set()
-        for _, raw_text in matches:
+        for href, raw_text in matches:
+            # Only count links that actually point at a guideline/circular
+            # document, not unrelated PDFs elsewhere on the page.
+            resolved = urljoin(RBZ_GUIDELINES_URL, href)
+            if "/documents/" not in resolved.lower():
+                continue
             clean = re.sub(r"<[^>]+>", "", raw_text)
             clean = re.sub(r"\s+", " ", clean).strip()
             if clean:

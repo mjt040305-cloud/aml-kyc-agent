@@ -20,8 +20,6 @@ CURRENCY_OPTIONS = {
     "USD": {"symbol": "$", "name": "US Dollar", "default_rate": 1.0},
     "ZAR": {"symbol": "R", "name": "South African Rand", "default_rate": 18.0},
     "ZWG": {"symbol": "ZiG", "name": "Zimbabwe Gold (ZiG)", "default_rate": 27.0},
-    "GBP": {"symbol": "\u00A3", "name": "British Pound", "default_rate": 0.79},
-    "EUR": {"symbol": "\u20AC", "name": "Euro", "default_rate": 0.92},
 }
 
 
