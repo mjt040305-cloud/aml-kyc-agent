@@ -503,45 +503,6 @@ def render_call_for_action_banner(txn):
     )
 
 
-def render_geographic_alert_watchlist():
-    """View A - FATF Geographic Alert Watchlist: reference/preventive info,
-    always shown regardless of whether any transaction data references it."""
-    st.subheader("\U0001F30D High Geographic Alert Watchlist")
-    st.caption("Reference / preventive geographic risk information - independent of the uploaded transaction data.")
-    rows = []
-    for country in ["North Korea", "Iran", "Myanmar"]:
-        classification = st.session_state.country_classifications.get(country.lower(), "Critical")
-        icon = "\U0001F534"
-        rows.append({"Jurisdiction": country, "FATF Status": "Call for Action",
-                     "Institutional Risk": classification, "Alert Level": f"{icon} {classification}"})
-    for country in st.session_state.watchlist_selected:
-        classification = st.session_state.country_classifications.get(country.lower(), "High")
-        icon = "\U0001F534" if classification in ("Critical", "Prohibited/Restricted") else "\U0001F7E0"
-        rows.append({"Jurisdiction": country, "FATF Status": "Increased Monitoring",
-                     "Institutional Risk": classification, "Alert Level": f"{icon} {classification}"})
-    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
-
-
-def render_actual_transaction_geo_risk(all_txns):
-    """View B - Actual Transaction Geographic Risk: ONLY countries whose
-    transactions in THIS batch actually generated a non-zero geographic
-    risk contribution. Deliberately excludes zero-contribution countries so
-    the watchlist (reference) and this view (actual data) are never mixed."""
-    st.subheader("\U0001F30D Actual Transaction Geographic Risk")
-    st.caption("Only jurisdictions with a non-zero geographic risk contribution in the uploaded data appear here.")
-    geo_rows = [
-        {"country": t["counterparty_country"], "geo_score": t.get("category_scores", {}).get("Geographic", 0)}
-        for t in all_txns if t.get("category_scores", {}).get("Geographic", 0) > 0
-    ]
-    if not geo_rows:
-        st.info("No transactions in this batch generated a geographic risk contribution.")
-        return
-    geo_df = pd.DataFrame(geo_rows).groupby("country")["geo_score"].sum().sort_values(ascending=False)
-    st.bar_chart(geo_df)
-    st.dataframe(geo_df.reset_index().rename(columns={"country": "Jurisdiction", "geo_score": "Geographic Risk Contribution"}),
-                 use_container_width=True, hide_index=True)
-
-
 def render_dashboard(all_txns):
     """Executive KPI cards + charts summarising the whole flagged population (all in USD)."""
     flagged = [t for t in all_txns if t["risk_bucket"] in ("High", "Medium")]
@@ -592,11 +553,6 @@ if st.session_state.pipeline_status in ("awaiting_review", "complete"):
 
     with st.expander("\U0001F4CA Executive dashboard", expanded=True):
         render_dashboard(all_txns)
-
-    with st.expander("\U0001F30D Geographic Risk (FATF & Institutional)", expanded=True):
-        render_geographic_alert_watchlist()
-        st.divider()
-        render_actual_transaction_geo_risk(all_txns)
 
     # -----------------------------------------------------------------
     # STEP 4: HUMAN OVERSIGHT CHECKPOINT (graph is paused via interrupt)
@@ -666,6 +622,25 @@ if st.session_state.pipeline_status in ("awaiting_review", "complete"):
         report_df = pd.DataFrame(st.session_state.final_report)
         if "case_reference" not in report_df.columns:
             report_df["case_reference"] = ""
+        # Defensive fallback: if this report came from a stale cached agent
+        # graph (e.g. a hot-reload that didn't rebuild the compiled
+        # LangGraph object) predating currency normalization, these columns
+        # could be missing. Fill them rather than crash, and surface a clear
+        # warning so the officer knows to reboot the app for a clean run.
+        fx_audit_defaults = {
+            "original_currency": "USD", "original_amount": report_df.get("amount", 0),
+            "usd_exchange_rate": 1.0, "fx_rate_source": "Unknown", "fx_rate_timestamp": "",
+        }
+        missing_fx_cols = [c for c in fx_audit_defaults if c not in report_df.columns]
+        if missing_fx_cols:
+            st.warning(
+                f"\u26A0\uFE0F This report is missing expected currency-audit fields ({', '.join(missing_fx_cols)}). "
+                "This usually means the app is running a stale cached session - please reboot the app "
+                "(Manage app \u2192 Reboot) and re-run the analysis for full auditability."
+            )
+            for col, default in fx_audit_defaults.items():
+                if col not in report_df.columns:
+                    report_df[col] = default
 
         display_cols = [
             "transaction_id", "customer_id", "original_currency", "original_amount",
@@ -673,6 +648,10 @@ if st.session_state.pipeline_status in ("awaiting_review", "complete"):
             "risk_bucket", "risk_score", "case_reference", "flag_reasons",
             "review_status", "reviewed_by", "reviewer_notes",
         ]
+        # Final safety net: even after the fillna pass above, only ever
+        # select columns that actually exist right now - this can never
+        # raise a KeyError regardless of what produced report_df.
+        display_cols = [c for c in display_cols if c in report_df.columns]
         st.dataframe(
             report_df[display_cols].rename(columns={"amount": "usd_equivalent"}),
             use_container_width=True
