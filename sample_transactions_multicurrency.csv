@@ -1,0 +1,9 @@
+transaction_id,customer_id,date,amount,currency,counterparty_country,transaction_type,customer_risk_profile
+MTX0001,CUST101,2026-06-01 09:00,50000,ZiG,Iran,wire_transfer,Medium
+MTX0002,CUST102,2026-06-02 10:00,20000,ZAR,South Africa,wire_transfer,Low
+MTX0003,CUST103,2026-06-03 11:00,10500,USD,USA,wire_transfer,Low
+MTX0004,CUST104,2026-06-04 12:00,9200,USD,Kenya,cash_deposit,Low
+MTX0005,CUST105,2026-06-05 13:00,750000,ZiG,Zimbabwe,mobile_money,Low
+MTX0006,CUST106,2026-06-06 14:00,450000,ZAR,Myanmar,wire_transfer,High
+MTX0007,CUST101,2026-06-06 15:00,60000,ZiG,Iran,wire_transfer,Medium
+MTX0008,CUST101,2026-06-06 17:00,55000,ZiG,Iran,wire_transfer,Medium

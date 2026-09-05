@@ -8,13 +8,24 @@ pipeline. Deliberately rule-based (transparent, explainable, auditable)
 rather than a black-box model - a compliance use case requires that a
 regulator or auditor can see WHY a transaction was flagged.
 
+IMPORTANT - USD baseline: this module assumes the 'amount' column it
+receives has ALREADY been normalized to its USD equivalent by
+fx_normalize.py, upstream in the pipeline (see agent_graph.py's analyse
+node). Every AML threshold and rule in this file is therefore always
+evaluated in USD, regardless of what currency a transaction was
+originally recorded in. This module does not perform currency conversion
+itself - see fx_normalize.py for that.
+
 Each rule belongs to one of four risk categories, mirroring how a real
 banking AML system decomposes risk:
 
     Customer Risk     - the customer's existing KYC risk classification
-    Transaction Risk  - characteristics of this specific transaction
-    Geographic Risk   - counterparty jurisdiction risk
-    Behavioural Risk  - deviation from the customer's own normal pattern
+    Transaction Risk  - characteristics of this specific transaction (USD)
+    Geographic Risk   - counterparty jurisdiction, per the INSTITUTION's
+                         own configured risk classification (see
+                         COUNTRY_CLASSIFICATION_WEIGHTS) - never
+                         auto-derived from FATF status (see fatf_reference.py)
+    Behavioural Risk  - deviation from the customer's own normal pattern (USD)
 
 Overall Risk Score = Customer Risk + Transaction Risk + Geographic Risk
                       + Behavioural Risk
@@ -24,11 +35,14 @@ to render a traffic-light-style "AML Rules Triggered" panel in the UI.
 
 All thresholds are configurable via a `config` dict (see DEFAULT_CONFIG),
 so a compliance officer can tune the agent to their institution's risk
-appetite from the Streamlit sidebar without editing code.
+appetite from the Streamlit sidebar without editing code. This agent
+flags transactions and provides reasons/evidence for human compliance
+review - it never autonomously determines that a transaction is illegal.
 """
 
 import pandas as pd
 import numpy as np
+import fatf_reference
 
 CATEGORIES = ["Customer", "Transaction", "Geographic", "Behavioural"]
 
@@ -42,9 +56,13 @@ SEVERITY_ICON = {"High": "\U0001F534", "Medium": "\U0001F7E0", "Low": "\U0001F7E
 DEFAULT_CONFIG = {
     "structuring_threshold": 10000,      # currency units - reporting threshold
     "structuring_margin": 0.10,          # "just under" = within 10% of threshold
-    "high_risk_countries": [
-        "north korea", "iran", "myanmar", "afghanistan", "syria", "somalia"
-    ],
+    # Institution-configured per-country risk classifications, e.g.
+    # {"iran": "High", "south africa": "Institution Selected"}. Deliberately
+    # EMPTY by default - this agent does not auto-classify any jurisdiction
+    # as high risk. See fatf_reference.py for FATF's own (separate,
+    # reference-only) status data, and app.py's Country Risk Classification
+    # panel for how the institution builds this dict.
+    "country_classifications": {},
     "rapid_movement_hours": 24,
     "rapid_movement_min_txns": 3,
     "round_number_multiple": 1000,
@@ -53,32 +71,66 @@ DEFAULT_CONFIG = {
     "high_risk_profile_min_amount": 3000,
 }
 
+# Weight/severity assigned per institution classification level. "Low" and
+# any unclassified country never trigger the geographic rule - consistent
+# with "do not automatically classify every country as high risk".
+COUNTRY_CLASSIFICATION_WEIGHTS = {
+    "Prohibited/Restricted": {"weight": 50, "severity": "High"},
+    "High": {"weight": 40, "severity": "High"},
+    "Medium": {"weight": 20, "severity": "Medium"},
+    "Low": {"weight": 0, "severity": "Low"},
+}
+
 
 def _is_round_number(amount: float, multiple: int) -> bool:
     return amount % multiple == 0 and amount > 0
 
 
 def _check_structuring(row, customer_txns, cfg) -> dict:
-    """Flag amounts just under the reporting threshold (classic 'smurfing')."""
+    """Flag amounts just under the reporting threshold (classic 'smurfing').
+    `row['amount']` is always the USD equivalent by the time this runs -
+    normalization happens upstream in fx_normalize.py before analysis."""
     threshold = cfg["structuring_threshold"]
     lower_bound = threshold * (1 - cfg["structuring_margin"])
     triggered = lower_bound <= row["amount"] < threshold
     return {
         "triggered": triggered,
-        "reason": f"Amount ${row['amount']:,.2f} sits just below the ${threshold:,.0f} reporting threshold (possible structuring)",
+        "reason": f"USD equivalent ${row['amount']:,.2f} sits just below the USD {threshold:,.0f} institutional structuring alert threshold (possible structuring)",
         "weight": 30, "category": "Transaction", "severity": "High",
         "label": "Large / structured transaction",
     }
 
 
 def _check_high_risk_country(row, customer_txns, cfg) -> dict:
-    country = str(row.get("counterparty_country", "")).strip().lower()
-    triggered = country in cfg["high_risk_countries"]
+    """
+    Geographic risk driven entirely by the INSTITUTION's own configured
+    classification for this country (Low/Medium/High/Prohibited-Restricted),
+    never automatically from FATF status. FATF's status is looked up only
+    to enrich the explanation shown to the compliance officer - it never
+    decides the outcome by itself (see fatf_reference.py).
+    """
+    country = str(row.get("counterparty_country", "")).strip()
+    classification = cfg["country_classifications"].get(country.lower())
+    fatf_status = fatf_reference.get_fatf_status(country)
+
+    if not classification or classification not in COUNTRY_CLASSIFICATION_WEIGHTS:
+        return {
+            "triggered": False,
+            "reason": f"'{country}' has no institutional high-risk classification on file (FATF status: {fatf_status})",
+            "weight": 0, "category": "Geographic", "severity": "Low",
+            "label": "No institutional geographic classification",
+        }
+
+    weight_info = COUNTRY_CLASSIFICATION_WEIGHTS[classification]
+    triggered = weight_info["weight"] > 0
     return {
         "triggered": triggered,
-        "reason": f"Counterparty jurisdiction '{row['counterparty_country']}' is on the high-risk country list",
-        "weight": 40, "category": "Geographic", "severity": "High",
-        "label": "High-risk jurisdiction",
+        "reason": (
+            f"Counterparty jurisdiction '{country}' is classified {classification} risk by this "
+            f"institution's risk appetite (FATF status: {fatf_status})"
+        ),
+        "weight": weight_info["weight"], "category": "Geographic", "severity": weight_info["severity"],
+        "label": f"Institution-classified {classification} jurisdiction" if triggered else "Low-risk jurisdiction (institution classified)",
     }
 
 
@@ -105,22 +157,23 @@ def _check_round_amount(row, customer_txns, cfg) -> dict:
     )
     return {
         "triggered": triggered,
-        "reason": f"Large round-number amount (${row['amount']:,.2f}) is atypical of normal commercial activity",
+        "reason": f"Large round-number USD equivalent (${row['amount']:,.2f}) is atypical of normal commercial activity",
         "weight": 10, "category": "Transaction", "severity": "Low",
         "label": "Round-number amount",
     }
 
 
 def _check_velocity_deviation(row, customer_txns, cfg) -> dict:
-    """Flag if amount is a statistical outlier vs this customer's own history."""
+    """Flag if amount is a statistical outlier vs this customer's own history.
+    All amounts compared here are USD equivalents (see fx_normalize.py)."""
     hist = customer_txns[customer_txns["date"] < row["date"]]["amount"]
     triggered = False
-    reason = "Amount is consistent with this customer's historical pattern"
+    reason = "USD equivalent is consistent with this customer's historical pattern"
     if len(hist) >= 4:
         mean, std = hist.mean(), hist.std()
         if std > 0 and row["amount"] > mean + cfg["velocity_std_multiplier"] * std:
             triggered = True
-            reason = f"Amount is {row['amount']/mean:.1f}x this customer's historical average (${mean:,.2f})"
+            reason = f"USD equivalent is {row['amount']/mean:.1f}x this customer's historical average (${mean:,.2f})"
     return {
         "triggered": triggered, "reason": reason,
         "weight": 20, "category": "Behavioural", "severity": "Medium",
@@ -133,7 +186,7 @@ def _check_customer_risk_profile(row, customer_txns, cfg) -> dict:
     triggered = profile == "high" and row["amount"] >= cfg["high_risk_profile_min_amount"]
     return {
         "triggered": triggered,
-        "reason": "Customer is already flagged High risk in KYC profile and made a significant transaction",
+        "reason": f"Customer is already flagged High risk in KYC profile and made a USD-equivalent transaction \u2265 ${cfg['high_risk_profile_min_amount']:,.0f}",
         "weight": 15, "category": "Customer", "severity": "Medium",
         "label": "Elevated KYC risk profile",
     }
@@ -175,7 +228,9 @@ def analyse_transactions(df: pd.DataFrame, config: dict = None) -> pd.DataFrame:
       triggered_rules (list of dicts: label, reason, severity, category, weight)
     """
     cfg = {**DEFAULT_CONFIG, **(config or {})}
-    cfg["high_risk_countries"] = {c.strip().lower() for c in cfg["high_risk_countries"]}
+    cfg["country_classifications"] = {
+        k.strip().lower(): v for k, v in cfg["country_classifications"].items()
+    }
 
     df = df.copy()
     df["date"] = pd.to_datetime(df["date"])
