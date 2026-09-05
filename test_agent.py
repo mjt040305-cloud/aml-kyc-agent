@@ -286,9 +286,127 @@ def test_missing_rate_safety_net():
               "ZAR" in e.missing_currencies)
 
 
+# ---------------------------------------------------------------------------
+# GEOGRAPHIC ALERT WATCHLIST TESTS (from the Geographic Risk redesign spec)
+# ---------------------------------------------------------------------------
+WATCHLIST_CFG = dict(DEFAULT_CONFIG)  # uses the pre-seeded Call-for-Action defaults
+
+
+def _single_txn_result(country, currency="USD", amount=500, cfg=None):
+    df = make_df([{"transaction_id": "TW", "customer_id": "CW", "date": "2026-06-01",
+                    "amount": amount, "currency": currency, "counterparty_country": country,
+                    "transaction_type": "wire_transfer", "customer_risk_profile": "Low"}])
+    normalized = normalize_transactions(df, FX_RATES, FX_SOURCES)
+    result = analyse_transactions(normalized, cfg or dict(WATCHLIST_CFG))
+    return result.iloc[0]
+
+
+def test_geo_1_iran():
+    row = _single_txn_result("Iran")
+    geo = [r for r in row["triggered_rules"] if r["category"] == "Geographic"]
+    check("GEO TEST 1: Iran triggers 'FATF High-Risk Jurisdiction — Call for Action'",
+          len(geo) == 1 and geo[0]["label"] == "FATF High-Risk Jurisdiction \u2014 Call for Action")
+
+
+def test_geo_2_dprk():
+    row = _single_txn_result("North Korea")
+    geo = [r for r in row["triggered_rules"] if r["category"] == "Geographic"]
+    check("GEO TEST 2: DPRK/North Korea triggers 'FATF High-Risk Jurisdiction — Call for Action'",
+          len(geo) == 1 and geo[0]["label"] == "FATF High-Risk Jurisdiction \u2014 Call for Action")
+
+
+def test_geo_3_myanmar():
+    row = _single_txn_result("Myanmar")
+    geo = [r for r in row["triggered_rules"] if r["category"] == "Geographic"]
+    check("GEO TEST 3: Myanmar triggers 'FATF High-Risk Jurisdiction — Call for Action'",
+          len(geo) == 1 and geo[0]["label"] == "FATF High-Risk Jurisdiction \u2014 Call for Action")
+
+
+def test_geo_4_institution_selected_syria():
+    cfg = dict(WATCHLIST_CFG)
+    cfg["country_classifications"] = dict(cfg["country_classifications"])
+    cfg["country_classifications"]["syria"] = "High"  # institution has selected Syria onto the watchlist
+    row = _single_txn_result("Syria", cfg=cfg)
+    geo = [r for r in row["triggered_rules"] if r["category"] == "Geographic"]
+    check("GEO TEST 4: institution-selected Syria triggers an institutional geographic alert",
+          len(geo) == 1 and geo[0]["weight"] > 0)
+    check("GEO TEST 4: Syria's label is NOT the Call-for-Action label (it's Increased Monitoring, not blacklisted)",
+          geo[0]["label"] != "FATF High-Risk Jurisdiction \u2014 Call for Action")
+
+
+def test_geo_5_unselected_increased_monitoring():
+    cfg = dict(WATCHLIST_CFG)  # Kenya (Increased Monitoring) NOT added to institution list
+    row = _single_txn_result("Kenya", cfg=cfg)
+    geo_triggered = any(r["category"] == "Geographic" and r["weight"] > 0 for r in row["triggered_rules"])
+    check("GEO TEST 5: unselected FATF Increased Monitoring country does NOT auto-trigger", not geo_triggered)
+
+
+def test_geo_6_zimbabwe():
+    row = _single_txn_result("Zimbabwe")
+    geo_triggered = any(r["category"] == "Geographic" and r["weight"] > 0 for r in row["triggered_rules"])
+    check("GEO TEST 6: Zimbabwe (not on any FATF list) triggers no geographic alert", not geo_triggered)
+    check("GEO TEST 6: Zimbabwe's FATF status is 'Not listed'", fatf_reference.get_fatf_status("Zimbabwe") == "Not listed")
+
+
+def test_geo_7_zig_iran():
+    row = _single_txn_result("Iran", currency="ZiG", amount=50000)
+    check("GEO TEST 7: ZiG transaction from Iran converted to USD before evaluation",
+          abs(row["amount"] - round(50000 * 0.024691, 2)) < 0.01)
+    geo = [r for r in row["triggered_rules"] if r["category"] == "Geographic"]
+    check("GEO TEST 7: geographic rule still correctly triggers after currency conversion", len(geo) == 1)
+
+
+def test_geo_8_zar_syria():
+    cfg = dict(WATCHLIST_CFG)
+    cfg["country_classifications"] = dict(cfg["country_classifications"])
+    cfg["country_classifications"]["syria"] = "High"
+    row = _single_txn_result("Syria", currency="ZAR", amount=20000, cfg=cfg)
+    check("GEO TEST 8: ZAR transaction from Syria converted to USD before evaluation",
+          abs(row["amount"] - round(20000 * 0.0540, 2)) < 0.01)
+    geo = [r for r in row["triggered_rules"] if r["category"] == "Geographic"]
+    check("GEO TEST 8: geographic rule still correctly triggers after currency conversion", len(geo) == 1)
+
+
+def test_geo_9_watchlist_vs_actual_separation():
+    # A watchlist country (Myanmar) with NO transactions in this batch should
+    # still be a valid reference entry, but must not appear in the "Actual
+    # Transaction Geographic Risk" view, which is built ONLY from geo_score>0
+    # rows actually present in the analysed batch (replicating app.py's
+    # render_actual_transaction_geo_risk filter logic).
+    df = make_df([{"transaction_id": "T1", "customer_id": "C1", "date": "2026-06-01",
+                    "amount": 500, "currency": "USD", "counterparty_country": "Iran",
+                    "transaction_type": "wire_transfer", "customer_risk_profile": "Low"}])
+    normalized = normalize_transactions(df, FX_RATES, FX_SOURCES)
+    result = analyse_transactions(normalized, dict(WATCHLIST_CFG))
+    records = result.to_dict("records")
+    actual_geo_countries = {
+        r["counterparty_country"] for r in records
+        if r.get("category_scores", {}).get("Geographic", 0) > 0
+    }
+    check("GEO TEST 9: Iran (has a transaction) appears in Actual Transaction Geographic Risk",
+          "Iran" in actual_geo_countries)
+    check("GEO TEST 9: Myanmar (watchlist reference only, no transactions here) does NOT appear in Actual view",
+          "Myanmar" not in actual_geo_countries)
+
+
+def test_geo_10_fatf_update_failure_continuity():
+    result = fatf_reference.refresh_fatf_data(timeout=2)
+    check("GEO TEST 10: refresh_fatf_data() never raises regardless of network outcome", isinstance(result, dict))
+    check("GEO TEST 10: FATF_CALL_FOR_ACTION remains exactly 3 entries after any refresh attempt",
+          len(fatf_reference.FATF_CALL_FOR_ACTION) == 3)
+    check("GEO TEST 10: FATF_INCREASED_MONITORING remains exactly 22 entries after any refresh attempt",
+          len(fatf_reference.FATF_INCREASED_MONITORING) == 22)
+    check("GEO TEST 10: application can continue scoring transactions after a refresh attempt",
+          _single_txn_result("Iran")["risk_bucket"] in ("High", "Medium", "Low", "None"))
+
+
 if __name__ == "__main__":
     for fn in [test_1, test_2, test_3, test_4, test_5, test_6, test_7, test_8,
-               test_9, test_10, test_11, test_12, test_missing_rate_safety_net]:
+               test_9, test_10, test_11, test_12, test_missing_rate_safety_net,
+               test_geo_1_iran, test_geo_2_dprk, test_geo_3_myanmar,
+               test_geo_4_institution_selected_syria, test_geo_5_unselected_increased_monitoring,
+               test_geo_6_zimbabwe, test_geo_7_zig_iran, test_geo_8_zar_syria,
+               test_geo_9_watchlist_vs_actual_separation, test_geo_10_fatf_update_failure_continuity]:
         try:
             fn()
         except Exception as e:

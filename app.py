@@ -65,8 +65,19 @@ defaults = {
     # FX state: rate/source per currency, resolved via live fetch or manual override
     "fx_rates": {"USD": 1.0},
     "fx_sources": {"USD": {"source": "Fixed", "timestamp": ""}},
-    # Country risk classification: {country_lower: "Low"|"Medium"|"High"|"Prohibited/Restricted"}
-    "country_classifications": {},
+    # Country risk classification: {country_lower: "Low"|"Medium"|"High"|"Critical"|"Prohibited/Restricted"}
+    # Pre-seeded with the three FATF Call-for-Action jurisdictions at
+    # "Critical" (institution can edit/remove), plus the three default
+    # institution-selected watchlist jurisdictions at "High" (matching the
+    # worked example) - the officer can change any of these.
+    "country_classifications": {
+        "north korea": "Critical", "iran": "Critical", "myanmar": "Critical",
+        "syria": "High", "south sudan": "High", "yemen": "High",
+    },
+    # Up to 3 FATF Increased Monitoring jurisdictions the institution has
+    # chosen to add to the curated High Geographic Alert Watchlist (see
+    # fatf_reference.FATF_INCREASED_MONITORING for the full eligible list).
+    "watchlist_selected": ["Syria", "South Sudan", "Yemen"],
     "fatf_check_result": None,
 }
 for k, v in defaults.items():
@@ -174,47 +185,104 @@ with st.sidebar:
         missing = [c for c in SUPPORTED_CURRENCIES if c not in resolved]
         st.warning(f"\u26A0\uFE0F No rate set yet for: {', '.join(missing)}. Required only if your uploaded data contains these currencies.")
 
-    # -------------------- High-Risk Jurisdictions --------------------
+    # -------------------- High Geographic Alert Watchlist --------------------
     st.divider()
-    st.header("\U0001F30D High-Risk Jurisdictions")
-    st.caption("Select jurisdictions according to institutional risk appetite. FATF status is shown for reference only and never auto-assigns a classification.")
-
-    search = st.text_input("\U0001F50D Search country/jurisdiction", key="country_search")
-    filtered = [c for c in ALL_COUNTRIES if search.lower() in c.lower()] if search else ALL_COUNTRIES
-    add_country = st.selectbox("Select a country to classify", options=[""] + filtered, key="country_to_add")
-    classification_choice = st.selectbox(
-        "Institution classification", ["Low", "Medium", "High", "Prohibited/Restricted"], key="classification_choice"
+    st.header("\U0001F30D High Geographic Alert Watchlist")
+    st.caption(
+        "Three jurisdictions are currently subject to a FATF Call for Action. Up to three "
+        "additional FATF-monitored jurisdictions may be selected by the institution according "
+        "to its documented risk assessment and risk appetite."
     )
-    if st.button("+ Add / update classification") and add_country:
-        st.session_state.country_classifications[add_country.lower()] = classification_choice
-        st.rerun()
 
-    if st.session_state.country_classifications:
-        st.markdown("**Selected jurisdictions:**")
-        for country_lower, classification in list(st.session_state.country_classifications.items()):
-            display_name = country_lower.title()
-            fatf_status = fatf_reference.get_fatf_status(display_name)
-            col_a, col_b = st.columns([5, 1])
-            with col_a:
-                st.markdown(f"`{display_name}` \u2014 **{classification}** *(FATF: {fatf_status})*")
-            with col_b:
-                if st.button("\u2715", key=f"remove_{country_lower}"):
-                    del st.session_state.country_classifications[country_lower]
-                    st.rerun()
+    st.markdown("**FATF Call for Action** *(automatically the highest geographic-risk category)*")
+    for country in ["North Korea", "Iran", "Myanmar"]:
+        current = st.session_state.country_classifications.get(country.lower(), "Critical")
+        col_a, col_b = st.columns([3, 2])
+        with col_a:
+            st.markdown(f"\U0001F534 **{country}** *(FATF: Call for Action)*")
+        with col_b:
+            new_level = st.selectbox(
+                "Level", ["Low", "Medium", "High", "Critical", "Prohibited/Restricted"],
+                index=["Low", "Medium", "High", "Critical", "Prohibited/Restricted"].index(current) if current in ["Low", "Medium", "High", "Critical", "Prohibited/Restricted"] else 2,
+                key=f"watchlist_level_{country}", label_visibility="collapsed",
+            )
+        st.session_state.country_classifications[country.lower()] = new_level
+
+    st.markdown("**Institution-selected FATF monitored jurisdictions** *(up to 3, from the Increased Monitoring list)*")
+    for i, country in enumerate(list(st.session_state.watchlist_selected)):
+        col_a, col_b, col_c = st.columns([3, 2, 1])
+        current = st.session_state.country_classifications.get(country.lower(), "High")
+        with col_a:
+            st.markdown(f"\U0001F7E0 **{country}** *(FATF: Increased Monitoring)*")
+        with col_b:
+            new_level = st.selectbox(
+                "Level", ["Low", "Medium", "High", "Critical"],
+                index=["Low", "Medium", "High", "Critical"].index(current) if current in ["Low", "Medium", "High", "Critical"] else 2,
+                key=f"watchlist_extra_level_{country}", label_visibility="collapsed",
+            )
+            st.session_state.country_classifications[country.lower()] = new_level
+        with col_c:
+            if st.button("\u2715", key=f"remove_watchlist_{country}"):
+                st.session_state.watchlist_selected.remove(country)
+                del st.session_state.country_classifications[country.lower()]
+                st.rerun()
+
+    if len(st.session_state.watchlist_selected) < 3:
+        eligible = [c for c in fatf_reference.FATF_INCREASED_MONITORING if c not in st.session_state.watchlist_selected]
+        replacement = st.selectbox("Add a jurisdiction (from FATF Increased Monitoring)", options=[""] + eligible, key="watchlist_add")
+        if st.button("+ Add to watchlist") and replacement:
+            st.session_state.watchlist_selected.append(replacement)
+            st.session_state.country_classifications[replacement.lower()] = "High"
+            st.rerun()
     else:
-        st.caption("No jurisdictions classified yet. This agent does not automatically classify any country as high risk.")
+        st.caption("3 of 3 slots used. Remove one above to select a different jurisdiction.")
+
+    with st.expander("\u2699\uFE0F Manage broader Geographic Risk (any jurisdiction)"):
+        st.caption(
+            "Beyond the curated watchlist above, the institution may classify ANY jurisdiction "
+            "according to its own documented risk assessment. FATF status is shown for reference "
+            "only and never auto-assigns a classification."
+        )
+        search = st.text_input("\U0001F50D Search country/jurisdiction", key="country_search")
+        filtered = [c for c in ALL_COUNTRIES if search.lower() in c.lower()] if search else ALL_COUNTRIES
+        add_country = st.selectbox("Select a country to classify", options=[""] + filtered, key="country_to_add")
+        classification_choice = st.selectbox(
+            "Institution classification", ["Low", "Medium", "High", "Critical", "Prohibited/Restricted"], key="classification_choice"
+        )
+        if st.button("+ Add / update classification") and add_country:
+            st.session_state.country_classifications[add_country.lower()] = classification_choice
+            st.rerun()
+
+        other_classified = {
+            k: v for k, v in st.session_state.country_classifications.items()
+            if k not in ["north korea", "iran", "myanmar"] and k.title() not in st.session_state.watchlist_selected
+        }
+        if other_classified:
+            st.markdown("**Additionally classified jurisdictions:**")
+            for country_lower, classification in list(other_classified.items()):
+                display_name = country_lower.title()
+                fatf_status = fatf_reference.get_fatf_status(display_name)
+                col_a, col_b = st.columns([5, 1])
+                with col_a:
+                    st.markdown(f"`{display_name}` \u2014 **{classification}** *(FATF: {fatf_status})*")
+                with col_b:
+                    if st.button("\u2715", key=f"remove_other_{country_lower}"):
+                        del st.session_state.country_classifications[country_lower]
+                        st.rerun()
 
     st.session_state.rules_config["country_classifications"] = st.session_state.country_classifications
 
     with st.expander("FATF June 2026 reference data"):
         st.caption(
             "Regulatory reference information only \u2014 FATF status never automatically determines "
-            "this institution's classification (see table above)."
+            "this institution's classification (see panels above)."
         )
+        st.markdown(f"**FATF Data:** June 2026")
+        st.markdown(f"**Source:** FATF (fatf-gafi.org)")
         st.markdown(f"**Call for Action (\"black list\"):** {', '.join(fatf_reference.FATF_CALL_FOR_ACTION)}")
         st.markdown(f"**Increased Monitoring (\"grey list\", {len(fatf_reference.FATF_INCREASED_MONITORING)} jurisdictions):**")
         st.caption(", ".join(fatf_reference.FATF_INCREASED_MONITORING))
-        st.caption(f"Bundled snapshot verified {fatf_reference.FATF_VERIFIED_AT} against FATF's {fatf_reference.FATF_PUBLICATION_DATE} publication.")
+        st.caption(f"Last successful update: {fatf_reference.FATF_VERIFIED_AT} (verified against FATF's {fatf_reference.FATF_PUBLICATION_DATE} publication)")
 
         if st.button("\U0001F504 Refresh FATF Data"):
             with st.spinner("Checking FATF's site..."):
@@ -225,10 +293,8 @@ with st.sidebar:
             r = st.session_state.fatf_check_result
             if r["status"] == "current":
                 st.success(f"\u2705 Current \u2014 {r['message']}")
-            elif r["status"] == "possibly_outdated":
-                st.warning(f"\u26A0\uFE0F Update unavailable \u2014 using last successfully cached dataset. {r['message']}")
             else:
-                st.warning(f"\u26A0\uFE0F Update unavailable \u2014 using last successfully cached dataset. {r['message']}")
+                st.warning(f"\u26A0\uFE0F FATF update unavailable. Last successfully cached FATF data is being used. {r['message']}")
             st.caption(f"Last check attempt: {r.get('checked_at', 'n/a')}")
 
 st.title("\U0001F6E1\uFE0F AML/KYC Compliance Flagging Agent")
@@ -413,6 +479,69 @@ def render_risk_breakdown(txn):
             st.markdown(f"{icon} **{r['label']}** ({r['category']}) \u2014 {r['reason']}")
 
 
+def render_call_for_action_banner(txn):
+    """Prominent warning when a transaction involves an active FATF Call for
+    Action jurisdiction. Never claims the transaction is illegal - flags it
+    for human compliance review per the agent's risk-based-approach design."""
+    geo_triggers = [r for r in txn.get("triggered_rules", []) if r["label"] == "FATF High-Risk Jurisdiction \u2014 Call for Action"]
+    if not geo_triggers:
+        return
+    oc = txn.get("original_currency", "USD")
+    oa = txn.get("original_amount", txn.get("amount"))
+    st.error(
+        f"\u26A0\uFE0F **HIGH GEOGRAPHIC RISK \u2014 FATF CALL FOR ACTION**\n\n"
+        f"**Country:** {txn.get('counterparty_country', '')}  \n"
+        f"**FATF Status:** Call for Action  \n"
+        f"**Transaction:** {txn['transaction_id']}  \n"
+        f"**Original Amount:** {oc} {oa:,.2f}  \n"
+        f"**Original Currency:** {oc}  \n"
+        f"**USD Equivalent:** ${txn.get('usd_equivalent', txn.get('amount')):,.2f}  \n"
+        f"**Customer Risk Profile:** {txn.get('customer_risk_profile', 'n/a')}  \n"
+        f"**AML Rules Triggered:** {'; '.join(r['label'] for r in txn.get('triggered_rules', []))}  \n\n"
+        f"**Recommended action:** Enhanced compliance review required according to institutional policy. "
+        f"This agent flags the transaction for human compliance review and does not determine that it is illegal."
+    )
+
+
+def render_geographic_alert_watchlist():
+    """View A - FATF Geographic Alert Watchlist: reference/preventive info,
+    always shown regardless of whether any transaction data references it."""
+    st.subheader("\U0001F30D High Geographic Alert Watchlist")
+    st.caption("Reference / preventive geographic risk information - independent of the uploaded transaction data.")
+    rows = []
+    for country in ["North Korea", "Iran", "Myanmar"]:
+        classification = st.session_state.country_classifications.get(country.lower(), "Critical")
+        icon = "\U0001F534"
+        rows.append({"Jurisdiction": country, "FATF Status": "Call for Action",
+                     "Institutional Risk": classification, "Alert Level": f"{icon} {classification}"})
+    for country in st.session_state.watchlist_selected:
+        classification = st.session_state.country_classifications.get(country.lower(), "High")
+        icon = "\U0001F534" if classification in ("Critical", "Prohibited/Restricted") else "\U0001F7E0"
+        rows.append({"Jurisdiction": country, "FATF Status": "Increased Monitoring",
+                     "Institutional Risk": classification, "Alert Level": f"{icon} {classification}"})
+    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+
+def render_actual_transaction_geo_risk(all_txns):
+    """View B - Actual Transaction Geographic Risk: ONLY countries whose
+    transactions in THIS batch actually generated a non-zero geographic
+    risk contribution. Deliberately excludes zero-contribution countries so
+    the watchlist (reference) and this view (actual data) are never mixed."""
+    st.subheader("\U0001F30D Actual Transaction Geographic Risk")
+    st.caption("Only jurisdictions with a non-zero geographic risk contribution in the uploaded data appear here.")
+    geo_rows = [
+        {"country": t["counterparty_country"], "geo_score": t.get("category_scores", {}).get("Geographic", 0)}
+        for t in all_txns if t.get("category_scores", {}).get("Geographic", 0) > 0
+    ]
+    if not geo_rows:
+        st.info("No transactions in this batch generated a geographic risk contribution.")
+        return
+    geo_df = pd.DataFrame(geo_rows).groupby("country")["geo_score"].sum().sort_values(ascending=False)
+    st.bar_chart(geo_df)
+    st.dataframe(geo_df.reset_index().rename(columns={"country": "Jurisdiction", "geo_score": "Geographic Risk Contribution"}),
+                 use_container_width=True, hide_index=True)
+
+
 def render_dashboard(all_txns):
     """Executive KPI cards + charts summarising the whole flagged population (all in USD)."""
     flagged = [t for t in all_txns if t["risk_bucket"] in ("High", "Medium")]
@@ -425,22 +554,9 @@ def render_dashboard(all_txns):
     k2.metric("Avg. score (flagged)", f"{avg_score:.0f}")
     k3.metric("% requiring review", f"{pct_review:.0f}%")
 
-    c1, c2 = st.columns(2)
-    with c1:
-        st.caption("Risk distribution")
-        bucket_counts = pd.Series([t["risk_bucket"] for t in all_txns]).value_counts()
-        st.bar_chart(bucket_counts)
-    with c2:
-        st.caption("Geographic risk contribution (by country, USD)")
-        geo_rows = [
-            {"country": t["counterparty_country"], "geo_score": t.get("category_scores", {}).get("Geographic", 0)}
-            for t in flagged
-        ]
-        if geo_rows:
-            geo_df = pd.DataFrame(geo_rows).groupby("country")["geo_score"].sum().sort_values(ascending=False)
-            st.bar_chart(geo_df)
-        else:
-            st.caption("No flagged transactions to summarise.")
+    st.caption("Risk distribution")
+    bucket_counts = pd.Series([t["risk_bucket"] for t in all_txns]).value_counts()
+    st.bar_chart(bucket_counts)
 
     st.caption("Most frequently triggered AML rules (flagged transactions)")
     rule_labels = [r["label"] for t in flagged for r in t.get("triggered_rules", []) if r["weight"] > 0]
@@ -477,6 +593,11 @@ if st.session_state.pipeline_status in ("awaiting_review", "complete"):
     with st.expander("\U0001F4CA Executive dashboard", expanded=True):
         render_dashboard(all_txns)
 
+    with st.expander("\U0001F30D Geographic Risk (FATF & Institutional)", expanded=True):
+        render_geographic_alert_watchlist()
+        st.divider()
+        render_actual_transaction_geo_risk(all_txns)
+
     # -----------------------------------------------------------------
     # STEP 4: HUMAN OVERSIGHT CHECKPOINT (graph is paused via interrupt)
     # -----------------------------------------------------------------
@@ -500,6 +621,7 @@ if st.session_state.pipeline_status in ("awaiting_review", "complete"):
                     f"{oc} {oa:,.2f} (USD equivalent: ${txn['amount']:,.2f}) "
                     f"\u2014 {txn['date']} \u2014 **Overall risk score: {txn['risk_score']}**"
                 )
+                render_call_for_action_banner(txn)
                 render_risk_breakdown(txn)
 
                 col_a, col_b, col_c = st.columns([1, 1, 2])
@@ -563,6 +685,7 @@ if st.session_state.pipeline_status in ("awaiting_review", "complete"):
         with st.expander("View full risk breakdown for a transaction"):
             txn_id = st.selectbox("Select transaction", report_df["transaction_id"].tolist())
             selected = next(t for t in st.session_state.final_report if t["transaction_id"] == txn_id)
+            render_call_for_action_banner(selected)
             render_risk_breakdown(selected)
 
         with st.expander("\U0001F50D Customer transaction history"):

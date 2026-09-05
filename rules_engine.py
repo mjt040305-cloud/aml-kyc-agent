@@ -57,12 +57,18 @@ DEFAULT_CONFIG = {
     "structuring_threshold": 10000,      # currency units - reporting threshold
     "structuring_margin": 0.10,          # "just under" = within 10% of threshold
     # Institution-configured per-country risk classifications, e.g.
-    # {"iran": "High", "south africa": "Institution Selected"}. Deliberately
-    # EMPTY by default - this agent does not auto-classify any jurisdiction
-    # as high risk. See fatf_reference.py for FATF's own (separate,
-    # reference-only) status data, and app.py's Country Risk Classification
-    # panel for how the institution builds this dict.
-    "country_classifications": {},
+    # {"iran": "Critical", "syria": "High"}. Pre-seeded ONLY with the three
+    # FATF Call-for-Action jurisdictions at "Critical" (the highest tier) -
+    # per the institution's own risk-based approach, these three
+    # automatically receive the highest geographic-risk category, but the
+    # officer can still edit or remove them like any other classification.
+    # This agent does NOT auto-classify any other jurisdiction as high risk
+    # - see fatf_reference.py for FATF's own (separate, reference-only)
+    # status data, and app.py's Geographic Risk panels for how the
+    # institution builds the rest of this dict.
+    "country_classifications": {
+        "north korea": "Critical", "iran": "Critical", "myanmar": "Critical",
+    },
     "rapid_movement_hours": 24,
     "rapid_movement_min_txns": 3,
     "round_number_multiple": 1000,
@@ -73,9 +79,12 @@ DEFAULT_CONFIG = {
 
 # Weight/severity assigned per institution classification level. "Low" and
 # any unclassified country never trigger the geographic rule - consistent
-# with "do not automatically classify every country as high risk".
+# with "do not automatically classify every country as high risk". FATF
+# status is NEVER used to auto-select a tier here - the institution always
+# chooses the tier itself (see rules_engine._check_high_risk_country).
 COUNTRY_CLASSIFICATION_WEIGHTS = {
-    "Prohibited/Restricted": {"weight": 50, "severity": "High"},
+    "Prohibited/Restricted": {"weight": 80, "severity": "High"},
+    "Critical": {"weight": 60, "severity": "High"},
     "High": {"weight": 40, "severity": "High"},
     "Medium": {"weight": 20, "severity": "Medium"},
     "Low": {"weight": 0, "severity": "Low"},
@@ -104,10 +113,15 @@ def _check_structuring(row, customer_txns, cfg) -> dict:
 def _check_high_risk_country(row, customer_txns, cfg) -> dict:
     """
     Geographic risk driven entirely by the INSTITUTION's own configured
-    classification for this country (Low/Medium/High/Prohibited-Restricted),
-    never automatically from FATF status. FATF's status is looked up only
-    to enrich the explanation shown to the compliance officer - it never
-    decides the outcome by itself (see fatf_reference.py).
+    classification for this country (Low/Medium/High/Critical/
+    Prohibited-Restricted), never automatically from FATF status alone.
+    FATF's status is looked up to enrich the explanation shown to the
+    compliance officer, and to select the exact alert label when a
+    jurisdiction is under an active FATF Call for Action - but the
+    institution's own classification always drives the weight/severity
+    (an institution may, per its documented risk assessment, classify a
+    Call-for-Action jurisdiction below Critical, or a non-listed
+    jurisdiction above Low - see fatf_reference.py).
     """
     country = str(row.get("counterparty_country", "")).strip()
     classification = cfg["country_classifications"].get(country.lower())
@@ -116,13 +130,21 @@ def _check_high_risk_country(row, customer_txns, cfg) -> dict:
     if not classification or classification not in COUNTRY_CLASSIFICATION_WEIGHTS:
         return {
             "triggered": False,
-            "reason": f"'{country}' has no institutional high-risk classification on file (FATF status: {fatf_status})",
+            "reason": f"'{country}' has no institutional geographic risk classification on file (FATF status: {fatf_status})",
             "weight": 0, "category": "Geographic", "severity": "Low",
             "label": "No institutional geographic classification",
         }
 
     weight_info = COUNTRY_CLASSIFICATION_WEIGHTS[classification]
     triggered = weight_info["weight"] > 0
+
+    if fatf_status == "Call for Action" and triggered:
+        label = "FATF High-Risk Jurisdiction \u2014 Call for Action"
+    elif triggered:
+        label = f"Institution-classified {classification} jurisdiction"
+    else:
+        label = "Low-risk jurisdiction (institution classified)"
+
     return {
         "triggered": triggered,
         "reason": (
@@ -130,7 +152,7 @@ def _check_high_risk_country(row, customer_txns, cfg) -> dict:
             f"institution's risk appetite (FATF status: {fatf_status})"
         ),
         "weight": weight_info["weight"], "category": "Geographic", "severity": weight_info["severity"],
-        "label": f"Institution-classified {classification} jurisdiction" if triggered else "Low-risk jurisdiction (institution classified)",
+        "label": label,
     }
 
 
