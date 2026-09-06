@@ -191,14 +191,15 @@ def check_for_updates(timeout=8):
 
     try:
         from urllib.parse import urljoin
-        matches = re.findall(
-            r'<a[^>]+href=["\']([^"\']+?\.pdf)["\'][^>]*>(.*?)</a>',
-            html, re.IGNORECASE | re.DOTALL,
-        )
+
+        # Primary pattern: any link (not just .pdf - some guidelines may be
+        # published as .docx, or a details page) whose resolved URL lives
+        # under the site's /documents/ path.
+        anchor_pattern = re.compile(r'<a[^>]+href=["\']([^"\']+)["\'][^>]*>(.*?)</a>', re.IGNORECASE | re.DOTALL)
+        all_anchors = anchor_pattern.findall(html)
+
         found_titles = set()
-        for href, raw_text in matches:
-            # Only count links that actually point at a guideline/circular
-            # document, not unrelated PDFs elsewhere on the page.
+        for href, raw_text in all_anchors:
             resolved = urljoin(RBZ_GUIDELINES_URL, href)
             if "/documents/" not in resolved.lower():
                 continue
@@ -210,7 +211,28 @@ def check_for_updates(timeout=8):
         return {"status": "error", "message": f"Fetched the page but could not parse it: {e}"}
 
     if not found_titles:
-        return {"status": "error", "message": "Page fetched successfully but no guideline links were found - the RBZ site's structure may have changed since this agent was built."}
+        # Distinguish *why* nothing matched, since guessing at a fix blind
+        # isn't productive - this tells the officer (and the developer)
+        # which of two very different problems occurred.
+        if "guideline" not in html.lower():
+            return {
+                "status": "error",
+                "message": (
+                    "Page fetched successfully but the word 'guideline' does not appear anywhere in the "
+                    "raw HTML - the content is likely loaded by JavaScript after the page loads, which a "
+                    "simple automated fetch cannot execute. This would need a browser-automation-based "
+                    "checker (e.g. Playwright) to read, which is beyond what a lightweight, free-tier "
+                    "deployment can reliably run."
+                ),
+            }
+        return {
+            "status": "error",
+            "message": (
+                f"Page fetched successfully and mentions guidelines, but no document links matching the "
+                f"expected pattern were found ({len(all_anchors)} links found on the page total) - the "
+                f"RBZ site's link structure has likely changed since this agent was built."
+            ),
+        }
 
     new_items = sorted(found_titles - KNOWN_GUIDELINES_SNAPSHOT)
 

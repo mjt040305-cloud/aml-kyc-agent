@@ -38,14 +38,17 @@ class ComplianceReportPDF(FPDF):
     def header(self):
         self.set_font("Helvetica", "B", 14)
         self.set_text_color(*NAVY)
+        self.set_x(self.l_margin)
         self.multi_cell(0, 10, "AML/KYC Compliance Report", align="C")
         self.set_font("Helvetica", "", 9)
         self.set_text_color(90, 90, 90)
+        self.set_x(self.l_margin)
         self.multi_cell(0, 6, f"Generated {datetime.now().strftime('%Y-%m-%d %H:%M')} - Educational prototype, simulated data only", align="C")
         self.ln(4)
 
     def footer(self):
         self.set_y(-15)
+        self.set_x(self.l_margin)
         self.set_font("Helvetica", "I", 8)
         self.set_text_color(120, 120, 120)
         self.multi_cell(0, 10, f"Page {self.page_no()}", align="C")
@@ -79,6 +82,7 @@ def build_pdf(final_report: list, rules_config: dict, output_path: str):
     # ---------------- Executive summary ----------------
     pdf.set_font("Helvetica", "B", 11)
     pdf.set_text_color(0, 0, 0)
+    pdf.set_x(pdf.l_margin)
     pdf.multi_cell(0, 8, "Executive Summary")
     pdf.set_font("Helvetica", "", 10)
     summary_lines = [
@@ -88,11 +92,13 @@ def build_pdf(final_report: list, rules_config: dict, output_path: str):
         f"Transactions escalated to SAR filing: {escalated}",
     ]
     for line in summary_lines:
+        pdf.set_x(pdf.l_margin)
         pdf.multi_cell(0, 6, _safe(line))
     pdf.ln(4)
 
     # ---------------- Rule configuration used ----------------
     pdf.set_font("Helvetica", "B", 11)
+    pdf.set_x(pdf.l_margin)
     pdf.multi_cell(0, 8, "Institutional Monitoring Parameters Applied")
     pdf.set_font("Helvetica", "", 9)
     classified = [f"{c.title()} ({v})" for c, v in country_classifications.items() if v and v != "Low"]
@@ -105,11 +111,13 @@ def build_pdf(final_report: list, rules_config: dict, output_path: str):
         f"Institution-classified jurisdictions (Medium/High/Prohibited): {', '.join(classified) if classified else 'none configured'}",
     ]
     for line in cfg_lines:
+        pdf.set_x(pdf.l_margin)
         pdf.multi_cell(0, 5, _safe(line))
     pdf.ln(4)
 
     # ---------------- Flagged transaction table ----------------
     pdf.set_font("Helvetica", "B", 11)
+    pdf.set_x(pdf.l_margin)
     pdf.multi_cell(0, 8, "Flagged Transactions (Medium/High Risk) - Full Audit Trail")
 
     col_widths = [14, 16, 22, 20, 18, 10, 14, 18, 22, 18, 40, 24, 18]
