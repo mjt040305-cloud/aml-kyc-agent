@@ -70,7 +70,7 @@ if st.session_state.authenticated_officer is None:
     tab_login, tab_register = st.tabs(["Sign In", "Register New Account"])
 
     with tab_login:
-        with st.form("login_form"):
+        with st.form("login_form", clear_on_submit=True):
             login_id = st.text_input("Officer ID or Email")
             login_pw = st.text_input("Password", type="password")
             submitted = st.form_submit_button("Sign In", type="primary")
@@ -83,7 +83,7 @@ if st.session_state.authenticated_officer is None:
                 st.error("Invalid credentials.")
 
     with tab_register:
-        with st.form("register_form"):
+        with st.form("register_form", clear_on_submit=True):
             full_name = st.text_input("Full Name")
             officer_id_input = st.text_input("Employee / Officer ID")
             email = st.text_input("Official Email")
@@ -179,7 +179,15 @@ if st.session_state.case_id is None:
                         st.session_state.final_report = restored["final_report"]
                         st.session_state.audit_trail = case_store.get_audit_trail(c["case_id"])
                         st.session_state.pipeline_status = restored["workflow_node"]
-                        st.success(f"Case {c['case_id']} restored.")
+                        # Re-seed each transaction's decision/notes widget
+                        # state BEFORE those widgets are instantiated below,
+                        # so a resumed review shows exactly what was saved -
+                        # not a reset "Pending" default for everything.
+                        prior_review_state = restored.get("review_state") or {}
+                        for tid, d in prior_review_state.items():
+                            st.session_state[f"decision_{tid}"] = d.get("status", "Pending")
+                            st.session_state[f"notes_{tid}"] = d.get("notes", "")
+                        st.success(f"Case {c['case_id']} restored \u2014 {sum(1 for d in prior_review_state.values() if d.get('status') != 'Pending')} prior decision(s) recovered.")
                         st.rerun()
         st.caption("Or start a new case below \u2014 your unfinished investigation(s) above remain saved.")
         st.divider()
@@ -713,15 +721,25 @@ if st.session_state.pipeline_status in ("awaiting_review", "complete"):
         if still_pending > 0:
             st.warning(f"\u26A0\uFE0F {still_pending} transaction(s) still marked Pending. The agent will remain paused until every transaction has a decision.")
 
-        # Autosave progress (notes + in-progress decisions) after every rerun,
-        # so a crash mid-review loses nothing - this does NOT sign/complete
-        # the case, only checkpoints where the officer currently stands.
+        # Autosave progress (every transaction's current decision + notes)
+        # on every rerun - i.e. every time the officer changes a decision
+        # dropdown for ANY transaction, the full current state of ALL
+        # transactions is re-persisted, not just the one just touched. This
+        # does NOT sign/complete the case, only checkpoints where the
+        # officer currently stands.
         case_store.save_case(
             st.session_state.case_id, officer["officer_id"],
             officer_notes_json={tid: d["notes"] for tid, d in decisions.items()},
             review_state_json=decisions,
             workflow_node="awaiting_review", status="in_progress",
         )
+        reviewed_count = sum(1 for d in decisions.values() if d["status"] != "Pending")
+        save_col1, save_col2 = st.columns([3, 1])
+        with save_col1:
+            st.caption(f"\U0001F4BE Progress auto-saved \u2014 {reviewed_count}/{len(decisions)} transaction(s) have a recorded decision so far.")
+        with save_col2:
+            if st.button("\U0001F4BE Save progress now"):
+                st.success("Saved.")
 
         if st.button("\u2705 CONFIRM & SIGN DECISION", type="primary", disabled=(still_pending > 0)):
             reviewed_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
