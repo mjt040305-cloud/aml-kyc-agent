@@ -108,10 +108,19 @@ def save_case(case_id, officer_id, **fields):
     are stored as JSON text. `workflow_node` and `status` are stored as
     plain strings.
 
+    Refuses to save without a real case_id/officer_id - SQLite allows
+    multiple NULL primary keys (unlike most databases), so without this
+    guard a bug elsewhere could silently create an orphan row with no
+    real identity, which would then correctly - but confusingly - fail
+    case_belongs_to_officer() for everyone, including its rightful owner.
+
     Refuses to modify a case already marked 'completed' - returns
     (False, message) in that case so app.py can redirect the action to
     append_audit() instead of silently overwriting a signed decision.
     """
+    if not case_id or not officer_id:
+        return False, "Cannot save a case without a valid case_id and officer_id."
+
     with get_conn() as conn:
         existing = conn.execute("SELECT status FROM cases WHERE case_id = ?", (case_id,)).fetchone()
 
@@ -161,11 +170,19 @@ def load_case(case_id):
 
 
 def list_unfinished_cases(officer_id):
-    """Cases belonging to this officer that are not yet completed."""
+    """Cases belonging to this officer that are not yet completed.
+    Excludes any row with a missing/empty case_id - such a row can never
+    pass case_belongs_to_officer() (SQLite treats NULL != NULL, so it
+    would always deny access, even to its own officer_id), so it must
+    never be shown as resumable in the first place. save_case() now
+    refuses to create these going forward; this filter also hides any
+    that already exist from before that guard was added."""
     with get_conn() as conn:
         rows = conn.execute(
             "SELECT case_id, workflow_node, status, risk_summary, updated_at FROM cases "
-            "WHERE officer_id = ? AND status != 'completed' ORDER BY updated_at DESC",
+            "WHERE officer_id = ? AND status != 'completed' "
+            "AND case_id IS NOT NULL AND TRIM(case_id) != '' "
+            "ORDER BY updated_at DESC",
             (officer_id,),
         ).fetchall()
     return [dict(r) for r in rows]
