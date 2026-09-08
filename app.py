@@ -48,8 +48,57 @@ from fx_normalize import SUPPORTED_CURRENCIES, CURRENCY_LABELS, FALLBACK_STARTIN
 from countries_list import ALL_COUNTRIES
 import fatf_reference
 import regulatory_watch
+import auth_db
+import case_store
 
 st.set_page_config(page_title="AML/KYC Compliance Agent", page_icon="\U0001F6E1\uFE0F", layout="wide")
+
+auth_db.init_auth_db()
+case_store.init_case_db()
+
+# ---------------------------------------------------------------------------
+# LOGIN / REGISTRATION GATE - nothing below this renders until an officer
+# authenticates. There is no code path anywhere else in this file that
+# accepts a typed-in reviewer name as an identity - only auth_db.verify_login()
+# establishes who is signed in.
+# ---------------------------------------------------------------------------
+if "authenticated_officer" not in st.session_state:
+    st.session_state.authenticated_officer = None
+
+if st.session_state.authenticated_officer is None:
+    st.title("\U0001F6E1\uFE0F AML/KYC Compliance Agent \u2014 Officer Sign-In")
+    tab_login, tab_register = st.tabs(["Sign In", "Register New Account"])
+
+    with tab_login:
+        with st.form("login_form"):
+            login_id = st.text_input("Officer ID or Email")
+            login_pw = st.text_input("Password", type="password")
+            submitted = st.form_submit_button("Sign In", type="primary")
+        if submitted:
+            officer = auth_db.verify_login(login_id, login_pw)
+            if officer:
+                st.session_state.authenticated_officer = officer
+                st.rerun()
+            else:
+                st.error("Invalid credentials.")
+
+    with tab_register:
+        with st.form("register_form"):
+            full_name = st.text_input("Full Name")
+            officer_id_input = st.text_input("Employee / Officer ID")
+            email = st.text_input("Official Email")
+            role = st.selectbox("Role", ["Compliance Officer", "Senior Compliance Officer", "Compliance Manager"])
+            pw1 = st.text_input("Password", type="password")
+            pw2 = st.text_input("Confirm Password", type="password")
+            reg_submitted = st.form_submit_button("Create Account", type="primary")
+        if reg_submitted:
+            if pw1 != pw2:
+                st.error("Passwords do not match.")
+            else:
+                ok, msg = auth_db.register_officer(full_name, officer_id_input, email, pw1, role)
+                (st.success if ok else st.error)(msg)
+
+    st.stop()
 
 # ---------------------------------------------------------------------------
 # Session state initialisation
@@ -91,10 +140,60 @@ def get_graph():
 
 graph = get_graph()
 
+officer = st.session_state.authenticated_officer
+
+if "case_id" not in st.session_state:
+    st.session_state.case_id = None
+
+# ---------------------------------------------------------------------------
+# UNFINISHED-CASE RECOVERY - shown once per login, before Step 1. Restores
+# the exact pending transactions, officer notes, and workflow stage from
+# SQLite (case_store.py) rather than Streamlit session_state, so a crash,
+# closed tab, or server restart never loses an in-progress investigation.
+# ---------------------------------------------------------------------------
+if st.session_state.case_id is None:
+    unfinished = case_store.list_unfinished_cases(officer["officer_id"])
+    if unfinished:
+        st.warning("\u26A0\uFE0F **UNFINISHED INVESTIGATION FOUND**")
+        for c in unfinished:
+            with st.container(border=True):
+                st.markdown(
+                    f"**Case ID:** {c['case_id']}  \n"
+                    f"**Officer:** {officer['full_name']}  \n"
+                    f"**Last activity:** {c['updated_at']}  \n"
+                    f"**Status:** {c['risk_summary'] or c['workflow_node']}"
+                )
+                if st.button("\u25B6 RESUME INVESTIGATION", key=f"resume_{c['case_id']}"):
+                    if not case_store.case_belongs_to_officer(c["case_id"], officer["officer_id"]):
+                        st.error("Access denied \u2014 this case does not belong to your account.")
+                    else:
+                        restored = case_store.load_case(c["case_id"])
+                        st.session_state.case_id = restored["case_id"]
+                        st.session_state.thread_id = restored["thread_id"] or str(uuid.uuid4())
+                        st.session_state.raw_df = pd.DataFrame(restored["transactions"]) if restored["transactions"] else None
+                        st.session_state.fx_rates = (restored["fx_state"] or {}).get("rates", {"USD": 1.0})
+                        st.session_state.fx_sources = (restored["fx_state"] or {}).get("sources", {"USD": {"source": "Fixed", "timestamp": ""}})
+                        st.session_state.rules_config = restored["rules_config"] or dict(DEFAULT_CONFIG)
+                        st.session_state.country_classifications = st.session_state.rules_config.get("country_classifications", {})
+                        st.session_state.pending_transactions = restored["pending"] or []
+                        st.session_state.final_report = restored["final_report"]
+                        st.session_state.audit_trail = case_store.get_audit_trail(c["case_id"])
+                        st.session_state.pipeline_status = restored["workflow_node"]
+                        st.success(f"Case {c['case_id']} restored.")
+                        st.rerun()
+        st.caption("Or start a new case below \u2014 your unfinished investigation(s) above remain saved.")
+        st.divider()
+
 # ---------------------------------------------------------------------------
 # SIDEBAR
 # ---------------------------------------------------------------------------
 with st.sidebar:
+    st.caption(f"Signed in as **{officer['full_name']}** ({officer['officer_id']}) \u2014 {officer['role']}")
+    if st.button("Sign out"):
+        st.session_state.authenticated_officer = None
+        st.session_state.case_id = None
+        st.rerun()
+    st.divider()
     st.header("\u2699\uFE0F Agent Configuration")
 
     # -------------------- Institutional monitoring thresholds --------------------
@@ -423,6 +522,7 @@ if raw_df is not None:
             with st.spinner("Agent normalizing currencies and analysing transactions..."):
                 st.session_state.thread_id = str(uuid.uuid4())  # fresh run each time
                 st.session_state.audit_trail = []
+                st.session_state.case_id = case_store.generate_case_id()
                 result = run_pipeline(
                     graph, raw_df.to_dict("records"), st.session_state.thread_id,
                     rules_config=st.session_state.rules_config,
@@ -430,10 +530,24 @@ if raw_df is not None:
                 )
             if result["status"] == "fx_error":
                 st.error(f"\u26A0\uFE0F Missing FX rate for: {', '.join(result['missing_currencies'])}. No transaction was evaluated - fix rates in the sidebar and retry.")
+                st.session_state.case_id = None
             elif result["status"] == "awaiting_review":
                 st.session_state.pipeline_status = "awaiting_review"
                 st.session_state.pending_transactions = result["pending_transactions"]
                 st.session_state.final_report = None
+                case_store.save_case(
+                    st.session_state.case_id, officer["officer_id"],
+                    thread_id=st.session_state.thread_id,
+                    transactions_json=raw_df.to_dict("records"),
+                    fx_state_json={"rates": st.session_state.fx_rates, "sources": st.session_state.fx_sources},
+                    rules_config_json=st.session_state.rules_config,
+                    pending_json=result["pending_transactions"],
+                    workflow_node="awaiting_review",
+                    status="in_progress",
+                    risk_summary=f"{len(result['pending_transactions'])} transaction(s) awaiting review",
+                )
+                case_store.append_audit(st.session_state.case_id, officer["officer_id"], officer["full_name"],
+                                         "ANALYSIS COMPLETE", previous_status=None, new_status="in_progress")
             else:
                 st.session_state.pipeline_status = "complete"
                 st.session_state.final_report = result["final_report"]
@@ -588,7 +702,8 @@ if st.session_state.pipeline_status in ("awaiting_review", "complete"):
                         key=f"decision_{txn['transaction_id']}"
                     )
                 with col_b:
-                    reviewer = st.text_input("Reviewer name", key=f"reviewer_{txn['transaction_id']}")
+                    reviewer = officer["full_name"]  # never manually typed - attached from the authenticated session
+                    st.markdown(f"**Reviewer:**  \n{reviewer}")
                 with col_c:
                     notes = st.text_input("Notes (optional)", key=f"notes_{txn['transaction_id']}")
 
@@ -598,7 +713,17 @@ if st.session_state.pipeline_status in ("awaiting_review", "complete"):
         if still_pending > 0:
             st.warning(f"\u26A0\uFE0F {still_pending} transaction(s) still marked Pending. The agent will remain paused until every transaction has a decision.")
 
-        if st.button("\u2705 Submit reviews & resume agent", type="primary", disabled=(still_pending > 0)):
+        # Autosave progress (notes + in-progress decisions) after every rerun,
+        # so a crash mid-review loses nothing - this does NOT sign/complete
+        # the case, only checkpoints where the officer currently stands.
+        case_store.save_case(
+            st.session_state.case_id, officer["officer_id"],
+            officer_notes_json={tid: d["notes"] for tid, d in decisions.items()},
+            review_state_json=decisions,
+            workflow_node="awaiting_review", status="in_progress",
+        )
+
+        if st.button("\u2705 CONFIRM & SIGN DECISION", type="primary", disabled=(still_pending > 0)):
             reviewed_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             for txn_id, d in decisions.items():
                 d["reviewed_at"] = reviewed_at
@@ -610,6 +735,16 @@ if st.session_state.pipeline_status in ("awaiting_review", "complete"):
                 result = resume_pipeline(graph, decisions, st.session_state.thread_id)
             st.session_state.pipeline_status = "complete"
             st.session_state.final_report = result["final_report"]
+
+            # Sign-off: locks the case (case_store.save_case() refuses any
+            # further edit once status='completed'), and records one
+            # audit_log entry per decision, each attributed to the
+            # authenticated officer - never a typed-in name.
+            for txn_id, d in decisions.items():
+                case_store.mark_case_completed(
+                    st.session_state.case_id, officer["officer_id"], officer["full_name"],
+                    decision_summary=f"{txn_id}: {d['status']}"
+                )
             st.rerun()
 
     # -----------------------------------------------------------------
@@ -687,10 +822,12 @@ if st.session_state.pipeline_status in ("awaiting_review", "complete"):
             else:
                 st.caption("Only one transaction on record for this customer.")
 
-        if st.session_state.audit_trail:
-            with st.expander("\U0001F4CB Timestamped audit trail"):
-                audit_df = pd.DataFrame(st.session_state.audit_trail)
+        audit_records = case_store.get_audit_trail(st.session_state.case_id) if st.session_state.case_id else []
+        if audit_records:
+            with st.expander("\U0001F4CB Timestamped audit trail (persistent)"):
+                audit_df = pd.DataFrame(audit_records)
                 st.dataframe(audit_df, use_container_width=True)
+                st.caption("Sourced from persistent storage, not session memory \u2014 survives a crash or restart.")
                 st.download_button(
                     "\u2B07 Download audit trail (CSV)",
                     data=audit_df.to_csv(index=False).encode("utf-8"),
