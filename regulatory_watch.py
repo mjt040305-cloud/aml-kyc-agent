@@ -182,10 +182,18 @@ def check_for_updates(timeout=8):
                               "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
                 "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
                 "Accept-Language": "en-US,en;q=0.9",
+                "Referer": "https://www.rbz.co.zw/",
             },
         )
         resp.raise_for_status()
         html = resp.text
+        # Diagnostics captured regardless of outcome, so a failure message
+        # can show exactly what was received instead of a bare guess.
+        final_url = resp.url
+        redirected = final_url != RBZ_GUIDELINES_URL
+        status_code = resp.status_code
+        content_length = len(html)
+        raw_snippet = re.sub(r"\s+", " ", html[:400]).strip()
     except Exception as e:
         return {"status": "error", "message": f"Could not reach the RBZ guidelines page right now: {e}"}
 
@@ -212,25 +220,33 @@ def check_for_updates(timeout=8):
 
     if not found_titles:
         # Distinguish *why* nothing matched, since guessing at a fix blind
-        # isn't productive - this tells the officer (and the developer)
-        # which of two very different problems occurred.
+        # isn't productive - this surfaces exactly what was received so the
+        # real cause (bot-blocking, redirect, JS-rendering, structure
+        # change) can be identified conclusively rather than guessed again.
+        diagnostics = (
+            f"\n\nDiagnostics: HTTP {status_code}"
+            + (f", redirected to {final_url}" if redirected else ", no redirect")
+            + f", {content_length:,} characters received, {len(all_anchors)} total <a> tags found.\n"
+            f"First 400 characters of the response:\n\"{raw_snippet}\""
+        )
         if "guideline" not in html.lower():
             return {
                 "status": "error",
                 "message": (
                     "Page fetched successfully but the word 'guideline' does not appear anywhere in the "
                     "raw HTML - the content is likely loaded by JavaScript after the page loads, which a "
-                    "simple automated fetch cannot execute. This would need a browser-automation-based "
-                    "checker (e.g. Playwright) to read, which is beyond what a lightweight, free-tier "
-                    "deployment can reliably run."
+                    "simple automated fetch cannot execute, OR the server returned a different page "
+                    "entirely (e.g. a bot-protection or redirect page) instead of the real guidelines "
+                    "listing." + diagnostics
                 ),
             }
         return {
             "status": "error",
             "message": (
                 f"Page fetched successfully and mentions guidelines, but no document links matching the "
-                f"expected pattern were found ({len(all_anchors)} links found on the page total) - the "
-                f"RBZ site's link structure has likely changed since this agent was built."
+                f"expected pattern were found - the RBZ site's link structure has likely changed since "
+                f"this agent was built, or very few/no <a> tags were present at all, which would suggest "
+                f"a block/interstitial page rather than the real listing." + diagnostics
             ),
         }
 
