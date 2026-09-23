@@ -64,6 +64,7 @@ def init_case_db():
                 final_report_json TEXT,
                 officer_notes_json TEXT,
                 review_state_json TEXT,
+                cosign_json TEXT,
                 workflow_node TEXT,
                 status TEXT NOT NULL DEFAULT 'in_progress',
                 risk_summary TEXT,
@@ -71,6 +72,14 @@ def init_case_db():
                 updated_at TEXT NOT NULL
             )
         """)
+        # Backward-compatible migration: a database created before the
+        # two-person sign-off feature won't have this column yet. SQLite
+        # has no "ADD COLUMN IF NOT EXISTS", so attempt it and ignore the
+        # error if the column is already there.
+        try:
+            conn.execute("ALTER TABLE cases ADD COLUMN cosign_json TEXT")
+        except sqlite3.OperationalError:
+            pass
         conn.execute("""
             CREATE TABLE IF NOT EXISTS audit_log (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -130,6 +139,7 @@ def save_case(case_id, officer_id, **fields):
         json_fields = {
             "transactions_json", "fx_state_json", "rules_config_json", "analysed_json",
             "pending_json", "final_report_json", "officer_notes_json", "review_state_json",
+            "cosign_json",
         }
         columns, values = [], []
         for key, value in fields.items():
@@ -161,7 +171,8 @@ def load_case(case_id):
         return None
     case = dict(row)
     for key in ["transactions_json", "fx_state_json", "rules_config_json", "analysed_json",
-                "pending_json", "final_report_json", "officer_notes_json", "review_state_json"]:
+                "pending_json", "final_report_json", "officer_notes_json", "review_state_json",
+                "cosign_json"]:
         if case.get(key):
             case[key.replace("_json", "")] = json.loads(case[key])
         else:
@@ -170,7 +181,13 @@ def load_case(case_id):
 
 
 def list_unfinished_cases(officer_id):
-    """Cases belonging to this officer that are not yet completed.
+    """Cases belonging to this officer that are still directly resumable
+    by them (status='in_progress'). Deliberately excludes 'completed' AND
+    'pending_cosign' cases - a case awaiting a second officer's
+    co-signature must not be resumable through the normal review flow,
+    or an autosave during that resume could silently revert its
+    pending_cosign state. See list_own_pending_cosign_cases() for a
+    read-only view of those instead.
     Excludes any row with a missing/empty case_id - such a row can never
     pass case_belongs_to_officer() (SQLite treats NULL != NULL, so it
     would always deny access, even to its own officer_id), so it must
@@ -180,12 +197,30 @@ def list_unfinished_cases(officer_id):
     with get_conn() as conn:
         rows = conn.execute(
             "SELECT case_id, workflow_node, status, risk_summary, updated_at FROM cases "
-            "WHERE officer_id = ? AND status != 'completed' "
+            "WHERE officer_id = ? AND status = 'in_progress' "
             "AND case_id IS NOT NULL AND TRIM(case_id) != '' "
             "ORDER BY updated_at DESC",
             (officer_id,),
         ).fetchall()
     return [dict(r) for r in rows]
+
+
+def list_own_pending_cosign_cases(officer_id):
+    """Read-only view for an officer to see their OWN cases currently
+    awaiting a second officer's co-signature - informational only, no
+    resume action, since only a DIFFERENT officer can act on these."""
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT case_id, cosign_json, updated_at FROM cases "
+            "WHERE officer_id = ? AND status = 'pending_cosign' ORDER BY updated_at DESC",
+            (officer_id,),
+        ).fetchall()
+    results = []
+    for r in rows:
+        d = dict(r)
+        d["cosign"] = json.loads(d["cosign_json"]) if d.get("cosign_json") else {}
+        results.append(d)
+    return results
 
 
 def case_belongs_to_officer(case_id, officer_id) -> bool:
@@ -223,3 +258,109 @@ def get_audit_trail(case_id):
             "SELECT * FROM audit_log WHERE case_id = ? ORDER BY timestamp ASC", (case_id,)
         ).fetchall()
     return [dict(r) for r in rows]
+
+
+# ---------------------------------------------------------------------------
+# TWO-PERSON SIGN-OFF (maker-checker) for High/Critical risk escalations.
+#
+# When a transaction is escalated to SAR filing AND its risk bucket is
+# High, the case does NOT complete on the first officer's signature alone.
+# It moves to status='pending_cosign' and waits for a SECOND, DIFFERENT
+# officer (with an appropriately senior role, enforced by app.py before
+# calling record_second_signature) to co-sign. Only once every such
+# transaction in the case has a second signature does the case become
+# 'completed' - at which point save_case()'s existing completed-lock
+# takes over exactly as it does for a single-signature case.
+# ---------------------------------------------------------------------------
+
+def submit_for_cosign(case_id, officer_id, officer_name, cosign_requirements: dict):
+    """
+    Marks a case as awaiting second sign-off instead of completing it
+    outright. `cosign_requirements`: {transaction_id: {...any case-specific
+    detail worth keeping, e.g. "risk_bucket", "decision", "amount_usd"}}
+    for each transaction that requires a second signature. Each entry is
+    stamped with the first officer's identity and timestamp here.
+    """
+    now = _now()
+    stamped = {
+        tid: {
+            **details,
+            "first_officer_id": officer_id, "first_officer_name": officer_name,
+            "first_signed_at": now,
+            "second_officer_id": None, "second_officer_name": None, "second_signed_at": None,
+        }
+        for tid, details in cosign_requirements.items()
+    }
+    save_case(case_id, officer_id, cosign_json=stamped, workflow_node="pending_cosign", status="pending_cosign")
+    append_audit(case_id, officer_id, officer_name, "SUBMIT FOR SECOND SIGN-OFF",
+                 previous_status="in_progress", new_status="pending_cosign",
+                 decision=f"{len(cosign_requirements)} transaction(s) require a second signature")
+
+
+def list_pending_cosign(exclude_officer_id):
+    """Cases awaiting a second officer's co-signature, excluding cases
+    originated by exclude_officer_id - an officer can never see their own
+    escalation in a queue meant for approving someone else's decision
+    (also re-enforced inside record_second_signature as a hard check)."""
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT case_id, officer_id, risk_summary, cosign_json, updated_at FROM cases "
+            "WHERE status = 'pending_cosign' AND officer_id != ? ORDER BY updated_at ASC",
+            (exclude_officer_id,),
+        ).fetchall()
+    results = []
+    for r in rows:
+        d = dict(r)
+        d["cosign"] = json.loads(d["cosign_json"]) if d.get("cosign_json") else {}
+        results.append(d)
+    return results
+
+
+def record_second_signature(case_id, transaction_id, second_officer_id, second_officer_name):
+    """
+    Records a second officer's co-signature for one transaction in a case
+    awaiting sign-off. Refuses if the second officer is the same as the
+    first (no self-approval) or if this transaction was already
+    co-signed. Once every transaction in the case's cosign record has a
+    second signature, the case is automatically marked 'completed', at
+    which point save_case()'s normal lock protects it exactly like any
+    other completed case.
+
+    Returns (success: bool, message: str).
+    """
+    case = load_case(case_id)
+    if case is None:
+        return False, "Case not found."
+    if case["status"] != "pending_cosign":
+        return False, "This case is not currently awaiting a second sign-off."
+
+    cosign = case.get("cosign") or {}
+    entry = cosign.get(transaction_id)
+    if entry is None:
+        return False, "This transaction is not part of the case's co-signature requirements."
+    if entry["first_officer_id"] == second_officer_id:
+        return False, "The officer who escalated this transaction cannot also provide the second sign-off."
+    if entry.get("second_officer_id"):
+        return False, "This transaction already has a second signature recorded."
+
+    entry["second_officer_id"] = second_officer_id
+    entry["second_officer_name"] = second_officer_name
+    entry["second_signed_at"] = _now()
+    cosign[transaction_id] = entry
+
+    all_signed = all(e.get("second_officer_id") for e in cosign.values())
+    new_status = "completed" if all_signed else "pending_cosign"
+
+    with get_conn() as conn:
+        conn.execute(
+            "UPDATE cases SET cosign_json = ?, status = ?, updated_at = ? WHERE case_id = ?",
+            (json.dumps(cosign), new_status, _now(), case_id),
+        )
+    append_audit(case_id, second_officer_id, second_officer_name, "SECOND SIGN-OFF (CO-SIGN)",
+                 previous_status="pending_cosign", new_status=new_status,
+                 decision=f"{transaction_id}: co-signed")
+    if all_signed:
+        append_audit(case_id, second_officer_id, second_officer_name, "CASE COMPLETED (ALL CO-SIGNATURES RECEIVED)",
+                     previous_status="pending_cosign", new_status="completed",
+                     decision="All required co-signatures received")
+    return True, "Co-signature recorded." + (" All required signatures received - case is now completed." if all_signed else " Awaiting further co-signature(s) on this case.")

@@ -50,6 +50,7 @@ import fatf_reference
 import regulatory_watch
 import auth_db
 import case_store
+import sar_narrative
 
 st.set_page_config(page_title="AML/KYC Compliance Agent", page_icon="\U0001F6E1\uFE0F", layout="wide")
 
@@ -193,7 +194,52 @@ if st.session_state.case_id is None:
         st.divider()
 
 # ---------------------------------------------------------------------------
-# SIDEBAR
+# TWO-PERSON SIGN-OFF (maker-checker) - shown alongside the resume screen.
+#
+# a) If THIS officer has any of their own High-risk escalations awaiting a
+#    second officer's signature, show that read-only, so they know it's
+#    in flight (they cannot act on it further themselves).
+# b) If this officer's role qualifies as a second signer (Senior
+#    Compliance Officer / Compliance Manager), show the queue of OTHER
+#    officers' escalations awaiting their co-signature, with the ability
+#    to review and co-sign each one.
+# ---------------------------------------------------------------------------
+SECOND_SIGNER_ROLES = {"Senior Compliance Officer", "Compliance Manager"}
+
+own_pending_cosign = case_store.list_own_pending_cosign_cases(officer["officer_id"])
+if own_pending_cosign:
+    with st.expander(f"\U0001F58A\uFE0F Your escalation(s) awaiting a second sign-off ({len(own_pending_cosign)})"):
+        st.caption("A different, senior officer must co-sign these before they close. No action needed from you.")
+        for c in own_pending_cosign:
+            pending_txns = [tid for tid, e in c["cosign"].items() if not e.get("second_officer_id")]
+            st.markdown(f"**{c['case_id']}** \u2014 {len(pending_txns)} transaction(s) still awaiting co-signature (updated {c['updated_at']})")
+
+if officer["role"] in SECOND_SIGNER_ROLES:
+    cosign_queue = case_store.list_pending_cosign(officer["officer_id"])
+    if cosign_queue:
+        st.warning(f"\U0001F58A\uFE0F **{len(cosign_queue)} CASE(S) AWAITING YOUR SECOND SIGN-OFF**")
+        for c in cosign_queue:
+            with st.container(border=True):
+                st.markdown(f"**Case ID:** {c['case_id']}  \n**Escalated by:** (a different officer)  \n**Last activity:** {c['updated_at']}")
+                for tid, entry in c["cosign"].items():
+                    if entry.get("second_officer_id"):
+                        continue  # already co-signed by someone (shouldn't normally appear here, but be safe)
+                    st.markdown(
+                        f"- **{tid}** \u2014 {entry.get('decision', 'Escalate to SAR filing')}, "
+                        f"risk: {entry.get('risk_bucket', 'High')}, "
+                        f"USD equivalent: ${entry.get('amount_usd', 0):,.2f}  \n"
+                        f"  First signed by **{entry['first_officer_name']}** at {entry['first_signed_at']}"
+                    )
+                    if st.button(f"\u2705 CO-SIGN & FINALIZE {tid}", key=f"cosign_{c['case_id']}_{tid}"):
+                        ok, msg = case_store.record_second_signature(
+                            c["case_id"], tid, officer["officer_id"], officer["full_name"]
+                        )
+                        (st.success if ok else st.error)(msg)
+                        if ok:
+                            st.rerun()
+        st.divider()
+
+
 # ---------------------------------------------------------------------------
 with st.sidebar:
     st.caption(f"Signed in as **{officer['full_name']}** ({officer['officer_id']}) \u2014 {officer['role']}")
@@ -702,6 +748,18 @@ if st.session_state.pipeline_status in ("awaiting_review", "complete"):
                 render_call_for_action_banner(txn)
                 render_risk_breakdown(txn)
 
+                with st.expander("\U0001F4DD Draft SAR narrative"):
+                    st.caption("System-composed first draft from this transaction's own facts - no external AI service, no API key. Review and edit before use.")
+                    narrative_key = f"sar_narrative_{txn['transaction_id']}"
+                    if st.button("Generate draft narrative", key=f"gen_{narrative_key}"):
+                        narrative, err = sar_narrative.generate_sar_narrative(txn)
+                        st.session_state[narrative_key] = narrative
+                    if st.session_state.get(narrative_key):
+                        st.text_area("Draft (editable)", value=st.session_state[narrative_key], height=180, key=f"edit_{narrative_key}")
+
+                if txn["risk_bucket"] == "High":
+                    st.caption("\u2139\uFE0F If escalated to SAR filing, this High-risk transaction will require a second, senior officer's co-signature before the case closes.")
+
                 col_a, col_b, col_c = st.columns([1, 1, 2])
                 with col_a:
                     status = st.selectbox(
@@ -754,15 +812,45 @@ if st.session_state.pipeline_status in ("awaiting_review", "complete"):
             st.session_state.pipeline_status = "complete"
             st.session_state.final_report = result["final_report"]
 
-            # Sign-off: locks the case (case_store.save_case() refuses any
-            # further edit once status='completed'), and records one
-            # audit_log entry per decision, each attributed to the
-            # authenticated officer - never a typed-in name.
-            for txn_id, d in decisions.items():
-                case_store.mark_case_completed(
-                    st.session_state.case_id, officer["officer_id"], officer["full_name"],
-                    decision_summary=f"{txn_id}: {d['status']}"
+            # Two-person sign-off (maker-checker): a High-risk transaction
+            # escalated to SAR filing does NOT complete the case on this
+            # officer's signature alone - it requires a second, different,
+            # senior officer to co-sign (see case_store.submit_for_cosign /
+            # record_second_signature). Every other decision in this batch
+            # still completes normally.
+            txn_by_id = {t["transaction_id"]: t for t in st.session_state.pending_transactions}
+            needs_cosign = {
+                tid: d for tid, d in decisions.items()
+                if d["status"] == "Escalate to SAR filing" and txn_by_id.get(tid, {}).get("risk_bucket") == "High"
+            }
+
+            if needs_cosign:
+                cosign_requirements = {
+                    tid: {
+                        "risk_bucket": "High",
+                        "decision": decisions[tid]["status"],
+                        "amount_usd": txn_by_id[tid]["amount"],
+                    }
+                    for tid in needs_cosign
+                }
+                case_store.submit_for_cosign(
+                    st.session_state.case_id, officer["officer_id"], officer["full_name"], cosign_requirements
                 )
+                st.warning(
+                    f"\U0001F58A\uFE0F {len(needs_cosign)} High-risk transaction(s) escalated to SAR filing require "
+                    f"a second, senior officer's co-signature. This case will remain open until that "
+                    f"co-signature is recorded - your decision and notes are saved."
+                )
+            else:
+                # No co-signature required - locks the case exactly as
+                # before (case_store.save_case() refuses any further edit
+                # once status='completed'), with one audit_log entry per
+                # decision, each attributed to the authenticated officer.
+                for txn_id, d in decisions.items():
+                    case_store.mark_case_completed(
+                        st.session_state.case_id, officer["officer_id"], officer["full_name"],
+                        decision_summary=f"{txn_id}: {d['status']}"
+                    )
             st.rerun()
 
     # -----------------------------------------------------------------
@@ -771,6 +859,17 @@ if st.session_state.pipeline_status in ("awaiting_review", "complete"):
     if st.session_state.pipeline_status == "complete":
         st.header("Step 5: Output - Compliance report")
         st.success("\u2705 Agent graph reached the output node \u2014 all flagged transactions have a recorded human decision.")
+
+        if st.session_state.case_id:
+            case_status = case_store.load_case(st.session_state.case_id)
+            if case_status and case_status["status"] == "pending_cosign":
+                st.warning(
+                    "\U0001F58A\uFE0F This case is NOT yet closed - one or more High-risk escalations here "
+                    "require a second, senior officer's co-signature. The report below reflects the AML "
+                    "pipeline's output; the case itself remains open in the audit trail until co-signed."
+                )
+            elif case_status and case_status["status"] == "completed":
+                st.caption("\u2705 This case is fully closed - all required signature(s) have been recorded.")
 
         report_df = pd.DataFrame(st.session_state.final_report)
         if "case_reference" not in report_df.columns:
