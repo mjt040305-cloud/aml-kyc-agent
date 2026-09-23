@@ -1,1002 +1,436 @@
 """
-AML/KYC Compliance Flagging Agent
-==================================
-HBF2212 - Artificial Intelligence in Finance, Project 2
+case_store.py
+--------------
+Persistent case storage for the AML/KYC Compliance Flagging Agent, backed
+by SQLite - NOT Streamlit session_state, which is lost on any browser
+crash, tab close, network drop, or server restart.
 
-An AI agent for AML/KYC transaction monitoring, orchestrated as a
-LangGraph state graph (see agent_graph.py):
+A "case" is one uploaded transaction batch under investigation by one
+authenticated officer. Every important workflow action (analysis
+complete, notes added, decision recorded, sign-off) calls save_case() so
+the investigation can be fully restored - including which transactions
+were flagged, their AML results, currency/FX-normalized values, the
+officer's notes, and exactly which workflow stage was reached - without
+re-running the pipeline.
 
-  START -> normalize -> analyse -> human_review (interrupt) -> output -> END
+CAVEAT (stated plainly, not hidden): on Streamlit Community Cloud's free
+tier, this SQLite file lives on the app's local disk, which persists
+across ordinary session crashes, browser closures, and network drops
+within a running container, but is NOT guaranteed to survive a full app
+redeploy or container recycle. For production durability across
+redeploys, this file would need to move to a persistent volume or an
+external database (e.g. Postgres) - the schema and functions below are
+written so that swap is a drop-in change (only get_conn() would need to
+target a different backend).
 
-  1. READ       -> user uploads a transaction CSV (USD, ZAR, and/or ZiG)
-  2. NORMALIZE  -> every transaction is converted to its USD equivalent
-                    (fx_normalize.py) - USD is the fixed AML baseline
-                    currency; original amount/currency are always preserved
-  3. ANALYSE    -> rules_engine.py scores every USD-normalized transaction
-                    across four risk categories: Customer, Transaction,
-                    Geographic (per the institution's own country risk
-                    classifications), and Behavioural
-  4. DECIDE     -> transactions are bucketed into Low / Medium / High risk,
-                    with every triggered rule shown and explained
-  5. HUMAN OVERSIGHT CHECKPOINT -> the graph genuinely pauses execution
-                    (via LangGraph's interrupt()) until a compliance
-                    officer supplies a timestamped decision for every
-                    Medium/High risk transaction
-  6. OUTPUT     -> the graph resumes and produces a reviewed, exportable
-                    compliance report (CSV + Excel + PDF) plus a
-                    timestamped audit trail and SAR case reference numbers
-
-This agent flags transactions and provides reasons/evidence for human
-compliance review - it never autonomously determines that a transaction
-is illegal, and no transaction is ever auto-reported.
-
-Run locally with:  streamlit run app.py
+Completed-case protection: once a case's status is 'completed', save_case()
+refuses to modify its decision fields - any further authorized action is
+recorded as a NEW audit_log entry, never a silent overwrite of the
+original signed decision.
 """
 
-import streamlit as st
-import pandas as pd
-from datetime import datetime
-import uuid
-import tempfile
+import sqlite3
+import json
 import os
-from io import BytesIO
+from datetime import datetime
+from contextlib import contextmanager
 
-from agent_graph import build_agent_graph, run_pipeline, resume_pipeline
-from rules_engine import SEVERITY_ICON, CATEGORIES, DEFAULT_CONFIG
-from pdf_report import build_pdf
-from fx_normalize import SUPPORTED_CURRENCIES, CURRENCY_LABELS, FALLBACK_STARTING_RATE_TO_USD, fetch_live_rate
-from countries_list import ALL_COUNTRIES
-import fatf_reference
-import regulatory_watch
-import auth_db
-import case_store
-import sar_narrative
-
-st.set_page_config(page_title="AML/KYC Compliance Agent", page_icon="\U0001F6E1\uFE0F", layout="wide")
-
-auth_db.init_auth_db()
-case_store.init_case_db()
-
-# ---------------------------------------------------------------------------
-# LOGIN / REGISTRATION GATE - nothing below this renders until an officer
-# authenticates. There is no code path anywhere else in this file that
-# accepts a typed-in reviewer name as an identity - only auth_db.verify_login()
-# establishes who is signed in.
-# ---------------------------------------------------------------------------
-if "authenticated_officer" not in st.session_state:
-    st.session_state.authenticated_officer = None
-
-if st.session_state.authenticated_officer is None:
-    st.title("\U0001F6E1\uFE0F AML/KYC Compliance Agent \u2014 Officer Sign-In")
-    tab_login, tab_register = st.tabs(["Sign In", "Register New Account"])
-
-    with tab_login:
-        with st.form("login_form", clear_on_submit=True):
-            login_id = st.text_input("Officer ID or Email")
-            login_pw = st.text_input("Password", type="password")
-            submitted = st.form_submit_button("Sign In", type="primary")
-        if submitted:
-            officer = auth_db.verify_login(login_id, login_pw)
-            if officer:
-                st.session_state.authenticated_officer = officer
-                st.rerun()
-            else:
-                st.error("Invalid credentials.")
-
-    with tab_register:
-        with st.form("register_form", clear_on_submit=True):
-            full_name = st.text_input("Full Name")
-            officer_id_input = st.text_input("Employee / Officer ID")
-            email = st.text_input("Official Email")
-            role = st.selectbox("Role", ["Compliance Officer", "Senior Compliance Officer", "Compliance Manager"])
-            pw1 = st.text_input("Password", type="password")
-            pw2 = st.text_input("Confirm Password", type="password")
-            reg_submitted = st.form_submit_button("Create Account", type="primary")
-        if reg_submitted:
-            if pw1 != pw2:
-                st.error("Passwords do not match.")
-            else:
-                ok, msg = auth_db.register_officer(full_name, officer_id_input, email, pw1, role)
-                (st.success if ok else st.error)(msg)
-
-    st.stop()
-
-# ---------------------------------------------------------------------------
-# Session state initialisation
-# ---------------------------------------------------------------------------
-defaults = {
-    "raw_df": None,
-    "thread_id": str(uuid.uuid4()),
-    "pipeline_status": None,          # None | "awaiting_review" | "complete"
-    "pending_transactions": [],
-    "final_report": None,
-    "rules_config": dict(DEFAULT_CONFIG),
-    "audit_trail": [],                # list of {transaction_id, status, reviewer, notes, reviewed_at}
-    # FX state: rate/source per currency, resolved via live fetch or manual override
-    "fx_rates": {"USD": 1.0},
-    "fx_sources": {"USD": {"source": "Fixed", "timestamp": ""}},
-    # Country risk classification: {country_lower: "Low"|"Medium"|"High"|"Critical"|"Prohibited/Restricted"}
-    # Pre-seeded with the three FATF Call-for-Action jurisdictions at
-    # "Critical" (institution can edit/remove), plus the three default
-    # institution-selected watchlist jurisdictions at "High" (matching the
-    # worked example) - the officer can change any of these.
-    "country_classifications": {
-        "north korea": "Critical", "iran": "Critical", "myanmar": "Critical",
-        "syria": "High", "south sudan": "High", "yemen": "High",
-    },
-    # Up to 3 FATF Increased Monitoring jurisdictions the institution has
-    # chosen to add to the curated High Geographic Alert Watchlist (see
-    # fatf_reference.FATF_INCREASED_MONITORING for the full eligible list).
-    "watchlist_selected": ["Syria", "South Sudan", "Yemen"],
-    "fatf_check_result": None,
-}
-for k, v in defaults.items():
-    if k not in st.session_state:
-        st.session_state[k] = v
+DB_PATH = os.environ.get("AML_AGENT_DB_PATH", "aml_agent.db")
 
 
-@st.cache_resource
-def get_graph():
-    return build_agent_graph()
-
-graph = get_graph()
-
-officer = st.session_state.authenticated_officer
-
-if "case_id" not in st.session_state:
-    st.session_state.case_id = None
-
-# ---------------------------------------------------------------------------
-# UNFINISHED-CASE RECOVERY - shown once per login, before Step 1. Restores
-# the exact pending transactions, officer notes, and workflow stage from
-# SQLite (case_store.py) rather than Streamlit session_state, so a crash,
-# closed tab, or server restart never loses an in-progress investigation.
-# ---------------------------------------------------------------------------
-if st.session_state.case_id is None:
-    unfinished = case_store.list_unfinished_cases(officer["officer_id"])
-    if unfinished:
-        st.warning("\u26A0\uFE0F **UNFINISHED INVESTIGATION FOUND**")
-        for c in unfinished:
-            with st.container(border=True):
-                st.markdown(
-                    f"**Case ID:** {c['case_id']}  \n"
-                    f"**Officer:** {officer['full_name']}  \n"
-                    f"**Last activity:** {c['updated_at']}  \n"
-                    f"**Status:** {c['risk_summary'] or c['workflow_node']}"
-                )
-                if st.button("\u25B6 RESUME INVESTIGATION", key=f"resume_{c['case_id']}"):
-                    if not case_store.case_belongs_to_officer(c["case_id"], officer["officer_id"]):
-                        st.error("Access denied \u2014 this case does not belong to your account.")
-                    else:
-                        restored = case_store.load_case(c["case_id"])
-                        st.session_state.case_id = restored["case_id"]
-                        st.session_state.thread_id = restored["thread_id"] or str(uuid.uuid4())
-                        st.session_state.raw_df = pd.DataFrame(restored["transactions"]) if restored["transactions"] else None
-                        st.session_state.fx_rates = (restored["fx_state"] or {}).get("rates", {"USD": 1.0})
-                        st.session_state.fx_sources = (restored["fx_state"] or {}).get("sources", {"USD": {"source": "Fixed", "timestamp": ""}})
-                        st.session_state.rules_config = restored["rules_config"] or dict(DEFAULT_CONFIG)
-                        st.session_state.country_classifications = st.session_state.rules_config.get("country_classifications", {})
-                        st.session_state.pending_transactions = restored["pending"] or []
-                        st.session_state.final_report = restored["final_report"]
-                        st.session_state.audit_trail = case_store.get_audit_trail(c["case_id"])
-                        st.session_state.pipeline_status = restored["workflow_node"]
-                        # Re-seed each transaction's decision/notes widget
-                        # state BEFORE those widgets are instantiated below,
-                        # so a resumed review shows exactly what was saved -
-                        # not a reset "Pending" default for everything.
-                        prior_review_state = restored.get("review_state") or {}
-                        for tid, d in prior_review_state.items():
-                            st.session_state[f"decision_{tid}"] = d.get("status", "Pending")
-                            st.session_state[f"notes_{tid}"] = d.get("notes", "")
-                        st.success(f"Case {c['case_id']} restored \u2014 {sum(1 for d in prior_review_state.values() if d.get('status') != 'Pending')} prior decision(s) recovered.")
-                        st.rerun()
-        st.caption("Or start a new case below \u2014 your unfinished investigation(s) above remain saved.")
-        st.divider()
-
-# ---------------------------------------------------------------------------
-# TWO-PERSON SIGN-OFF (maker-checker) - shown alongside the resume screen.
-#
-# a) If THIS officer has any of their own High-risk escalations awaiting a
-#    second officer's signature, show that read-only, so they know it's
-#    in flight (they cannot act on it further themselves).
-# b) If this officer's role qualifies as a second signer (Senior
-#    Compliance Officer / Compliance Manager), show the queue of OTHER
-#    officers' escalations awaiting their co-signature, with the ability
-#    to review and co-sign each one.
-# ---------------------------------------------------------------------------
-SECOND_SIGNER_ROLES = {"Senior Compliance Officer", "Compliance Manager"}
-
-own_pending_cosign = case_store.list_own_pending_cosign_cases(officer["officer_id"])
-if own_pending_cosign:
-    with st.expander(f"\U0001F58A\uFE0F Your escalation(s) awaiting a second sign-off ({len(own_pending_cosign)})"):
-        st.caption("A different, senior officer must co-sign these before they close. No action needed from you.")
-        for c in own_pending_cosign:
-            pending_txns = [tid for tid, e in c["cosign"].items() if not e.get("second_officer_id")]
-            st.markdown(f"**{c['case_id']}** \u2014 {len(pending_txns)} transaction(s) still awaiting co-signature (updated {c['updated_at']})")
-
-if officer["role"] in SECOND_SIGNER_ROLES:
-    cosign_queue = case_store.list_pending_cosign(officer["officer_id"])
-    if cosign_queue:
-        st.warning(f"\U0001F58A\uFE0F **{len(cosign_queue)} CASE(S) AWAITING YOUR SECOND SIGN-OFF**")
-        for c in cosign_queue:
-            with st.container(border=True):
-                st.markdown(f"**Case ID:** {c['case_id']}  \n**Escalated by:** (a different officer)  \n**Last activity:** {c['updated_at']}")
-                for tid, entry in c["cosign"].items():
-                    if entry.get("second_officer_id"):
-                        continue  # already co-signed by someone (shouldn't normally appear here, but be safe)
-                    st.markdown(
-                        f"- **{tid}** \u2014 {entry.get('decision', 'Escalate to SAR filing')}, "
-                        f"risk: {entry.get('risk_bucket', 'High')}, "
-                        f"USD equivalent: ${entry.get('amount_usd', 0):,.2f}  \n"
-                        f"  First signed by **{entry['first_officer_name']}** at {entry['first_signed_at']}"
-                    )
-                    if st.button(f"\u2705 CO-SIGN & FINALIZE {tid}", key=f"cosign_{c['case_id']}_{tid}"):
-                        ok, msg = case_store.record_second_signature(
-                            c["case_id"], tid, officer["officer_id"], officer["full_name"]
-                        )
-                        (st.success if ok else st.error)(msg)
-                        if ok:
-                            st.rerun()
-        st.divider()
+@contextmanager
+def get_conn():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    try:
+        yield conn
+        conn.commit()
+    finally:
+        conn.close()
 
 
-# ---------------------------------------------------------------------------
-with st.sidebar:
-    st.caption(f"Signed in as **{officer['full_name']}** ({officer['officer_id']}) \u2014 {officer['role']}")
-    if st.button("Sign out"):
-        st.session_state.authenticated_officer = None
-        st.session_state.case_id = None
-        st.rerun()
-    st.divider()
-    st.header("\u2699\uFE0F Agent Configuration")
-
-    # -------------------- Institutional monitoring thresholds --------------------
-    st.subheader("Institutional Monitoring Thresholds")
-    st.caption(
-        "This is an institution-configured transaction-monitoring threshold based on the "
-        "institution's risk appetite. It is not presented as a universal RBZ suspicious "
-        "transaction reporting threshold."
-    )
-
-    structuring_threshold = st.number_input(
-        "Institutional Structuring Alert Threshold (USD)", min_value=1000, max_value=100000,
-        value=st.session_state.rules_config["structuring_threshold"], step=500
-    )
-    structuring_margin = st.slider(
-        "Structuring margin (% below threshold)", 1, 30,
-        int(st.session_state.rules_config["structuring_margin"] * 100)
-    ) / 100
-    rapid_hours = st.slider("Rapid movement window (hours)", 1, 72, st.session_state.rules_config["rapid_movement_hours"])
-    rapid_min_txns = st.slider("Rapid movement min. transactions", 2, 10, st.session_state.rules_config["rapid_movement_min_txns"])
-    velocity_mult = st.slider("Velocity deviation (std. deviations)", 1, 6, st.session_state.rules_config["velocity_std_multiplier"])
-
-    st.session_state.rules_config = {
-        "structuring_threshold": structuring_threshold,
-        "structuring_margin": structuring_margin,
-        "country_classifications": st.session_state.country_classifications,
-        "rapid_movement_hours": rapid_hours,
-        "rapid_movement_min_txns": rapid_min_txns,
-        "round_number_multiple": DEFAULT_CONFIG["round_number_multiple"],
-        "round_number_min_amount": DEFAULT_CONFIG["round_number_min_amount"],
-        "velocity_std_multiplier": velocity_mult,
-        "high_risk_profile_min_amount": DEFAULT_CONFIG["high_risk_profile_min_amount"],
-    }
-    st.caption("Changes apply the next time you click **Run compliance analysis**.")
-
-    # -------------------- Currency & FX Normalization --------------------
-    st.divider()
-    st.header("\U0001F4B1 Currency & FX Normalization")
-    st.info(
-        "All uploaded transaction currencies are normalized to USD before AML compliance "
-        "evaluation. Original transaction amounts and currencies are preserved for auditability."
-    )
-    st.markdown(f"**Accepted transaction currencies:** {', '.join(SUPPORTED_CURRENCIES)}")
-    st.markdown("**AML baseline currency:** `USD` \U0001F512 *(locked - not user-changeable)*")
-
-    for code in SUPPORTED_CURRENCIES:
-        if code == "USD":
-            continue
-        with st.expander(f"{code} \u2014 {CURRENCY_LABELS[code]}", expanded=(code == "ZWG")):
-            col_a, col_b = st.columns([1, 1])
-            with col_a:
-                if st.button(f"\U0001F504 Fetch live rate", key=f"live_{code}"):
-                    rate, info = fetch_live_rate(code)
-                    if rate is not None:
-                        st.session_state.fx_rates[code] = rate
-                        st.session_state.fx_sources[code] = {"source": "Live", "timestamp": info.get("timestamp", "")}
-                        st.success(info["message"])
-                    else:
-                        st.warning(f"\u26A0\uFE0F Live FX unavailable: {info['message']}")
-            with col_b:
-                current_rate = st.session_state.fx_rates.get(code, FALLBACK_STARTING_RATE_TO_USD[code])
-                manual_rate = st.number_input(
-                    f"Manual override (1 {code} = ? USD)", min_value=0.0000001,
-                    value=float(current_rate), step=0.0001, format="%.6f", key=f"manual_{code}"
-                )
-                if st.button(f"Apply manual override", key=f"apply_{code}"):
-                    st.session_state.fx_rates[code] = manual_rate
-                    st.session_state.fx_sources[code] = {
-                        "source": "Manual Override",
-                        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                    }
-                    st.success(f"Manual override recorded for {code}. This does not modify any original transaction data.")
-
-            src = st.session_state.fx_sources.get(code)
-            if src:
-                rate_val = st.session_state.fx_rates.get(code)
-                st.caption(
-                    f"FX Source: **{src['source']}**  |  FX Rate: 1 {code} = {rate_val:.6f} USD  |  "
-                    f"Last Updated: {src['timestamp'] or 'not yet set'}"
-                )
-            else:
-                st.caption("\u26A0\uFE0F No rate set yet for this currency \u2014 required before analysis if present in your data.")
-
-    resolved = [c for c in SUPPORTED_CURRENCIES if c in st.session_state.fx_rates]
-    if len(resolved) == len(SUPPORTED_CURRENCIES):
-        st.success("\u2705 All supported currencies have a resolved USD rate.")
-    else:
-        missing = [c for c in SUPPORTED_CURRENCIES if c not in resolved]
-        st.warning(f"\u26A0\uFE0F No rate set yet for: {', '.join(missing)}. Required only if your uploaded data contains these currencies.")
-
-    # -------------------- High Geographic Alert Watchlist --------------------
-    st.divider()
-    st.header("\U0001F30D High Geographic Alert Watchlist")
-    st.caption(
-        "Three jurisdictions are currently subject to a FATF Call for Action. Up to three "
-        "additional FATF-monitored jurisdictions may be selected by the institution according "
-        "to its documented risk assessment and risk appetite."
-    )
-
-    st.markdown("**FATF Call for Action** *(automatically the highest geographic-risk category)*")
-    for country in ["North Korea", "Iran", "Myanmar"]:
-        current = st.session_state.country_classifications.get(country.lower(), "Critical")
-        col_a, col_b = st.columns([3, 2])
-        with col_a:
-            st.markdown(f"\U0001F534 **{country}** *(FATF: Call for Action)*")
-        with col_b:
-            new_level = st.selectbox(
-                "Level", ["Low", "Medium", "High", "Critical", "Prohibited/Restricted"],
-                index=["Low", "Medium", "High", "Critical", "Prohibited/Restricted"].index(current) if current in ["Low", "Medium", "High", "Critical", "Prohibited/Restricted"] else 2,
-                key=f"watchlist_level_{country}", label_visibility="collapsed",
+def init_case_db():
+    with get_conn() as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS cases (
+                case_id TEXT PRIMARY KEY,
+                officer_id TEXT NOT NULL,
+                thread_id TEXT,
+                transactions_json TEXT,
+                fx_state_json TEXT,
+                rules_config_json TEXT,
+                analysed_json TEXT,
+                pending_json TEXT,
+                final_report_json TEXT,
+                officer_notes_json TEXT,
+                review_state_json TEXT,
+                cosign_json TEXT,
+                workflow_node TEXT,
+                status TEXT NOT NULL DEFAULT 'in_progress',
+                risk_summary TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
             )
-        st.session_state.country_classifications[country.lower()] = new_level
-
-    st.markdown("**Institution-selected FATF monitored jurisdictions** *(up to 3, from the Increased Monitoring list)*")
-    for i, country in enumerate(list(st.session_state.watchlist_selected)):
-        col_a, col_b, col_c = st.columns([3, 2, 1])
-        current = st.session_state.country_classifications.get(country.lower(), "High")
-        with col_a:
-            st.markdown(f"\U0001F7E0 **{country}** *(FATF: Increased Monitoring)*")
-        with col_b:
-            new_level = st.selectbox(
-                "Level", ["Low", "Medium", "High", "Critical"],
-                index=["Low", "Medium", "High", "Critical"].index(current) if current in ["Low", "Medium", "High", "Critical"] else 2,
-                key=f"watchlist_extra_level_{country}", label_visibility="collapsed",
+        """)
+        # Backward-compatible migration: a database created before the
+        # two-person sign-off feature won't have this column yet. SQLite
+        # has no "ADD COLUMN IF NOT EXISTS", so attempt it and ignore the
+        # error if the column is already there.
+        try:
+            conn.execute("ALTER TABLE cases ADD COLUMN cosign_json TEXT")
+        except sqlite3.OperationalError:
+            pass
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS audit_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                case_id TEXT NOT NULL,
+                officer_id TEXT NOT NULL,
+                officer_name TEXT NOT NULL,
+                action TEXT NOT NULL,
+                previous_status TEXT,
+                new_status TEXT,
+                decision TEXT,
+                timestamp TEXT NOT NULL
             )
-            st.session_state.country_classifications[country.lower()] = new_level
-        with col_c:
-            if st.button("\u2715", key=f"remove_watchlist_{country}"):
-                st.session_state.watchlist_selected.remove(country)
-                del st.session_state.country_classifications[country.lower()]
-                st.rerun()
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS security_alerts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                case_id TEXT NOT NULL,
+                officer_id TEXT NOT NULL,
+                transaction_id TEXT NOT NULL,
+                customer_id TEXT,
+                amount_usd REAL NOT NULL,
+                threshold_usd REAL NOT NULL,
+                alert_type TEXT NOT NULL,
+                triggered_at TEXT NOT NULL,
+                acknowledged_by TEXT,
+                acknowledged_at TEXT
+            )
+        """)
 
-    if len(st.session_state.watchlist_selected) < 3:
-        eligible = [c for c in fatf_reference.FATF_INCREASED_MONITORING if c not in st.session_state.watchlist_selected]
-        replacement = st.selectbox("Add a jurisdiction (from FATF Increased Monitoring)", options=[""] + eligible, key="watchlist_add")
-        if st.button("+ Add to watchlist") and replacement:
-            st.session_state.watchlist_selected.append(replacement)
-            st.session_state.country_classifications[replacement.lower()] = "High"
-            st.rerun()
-    else:
-        st.caption("3 of 3 slots used. Remove one above to select a different jurisdiction.")
 
-    with st.expander("\u2699\uFE0F Manage broader Geographic Risk (any jurisdiction)"):
-        st.caption(
-            "Beyond the curated watchlist above, the institution may classify ANY jurisdiction "
-            "according to its own documented risk assessment. FATF status is shown for reference "
-            "only and never auto-assigns a classification."
-        )
-        search = st.text_input("\U0001F50D Search country/jurisdiction", key="country_search")
-        filtered = [c for c in ALL_COUNTRIES if search.lower() in c.lower()] if search else ALL_COUNTRIES
-        add_country = st.selectbox("Select a country to classify", options=[""] + filtered, key="country_to_add")
-        classification_choice = st.selectbox(
-            "Institution classification", ["Low", "Medium", "High", "Critical", "Prohibited/Restricted"], key="classification_choice"
-        )
-        if st.button("+ Add / update classification") and add_country:
-            st.session_state.country_classifications[add_country.lower()] = classification_choice
-            st.rerun()
+def generate_case_id():
+    """e.g. AML-2026-00125 - sequential per year."""
+    year = datetime.now().year
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT COUNT(*) as n FROM cases WHERE case_id LIKE ?", (f"AML-{year}-%",)
+        ).fetchone()
+    seq = row["n"] + 1
+    return f"AML-{year}-{seq:05d}"
 
-        other_classified = {
-            k: v for k, v in st.session_state.country_classifications.items()
-            if k not in ["north korea", "iran", "myanmar"] and k.title() not in st.session_state.watchlist_selected
+
+def _now():
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def save_case(case_id, officer_id, **fields):
+    """
+    Create or update a case. JSON-serializable fields (transactions,
+    fx_state, rules_config, analysed, pending, final_report, review_state)
+    are stored as JSON text. `workflow_node` and `status` are stored as
+    plain strings.
+
+    Refuses to save without a real case_id/officer_id - SQLite allows
+    multiple NULL primary keys (unlike most databases), so without this
+    guard a bug elsewhere could silently create an orphan row with no
+    real identity, which would then correctly - but confusingly - fail
+    case_belongs_to_officer() for everyone, including its rightful owner.
+
+    Refuses to modify a case already marked 'completed' - returns
+    (False, message) in that case so app.py can redirect the action to
+    append_audit() instead of silently overwriting a signed decision.
+    """
+    if not case_id or not officer_id:
+        return False, "Cannot save a case without a valid case_id and officer_id."
+
+    with get_conn() as conn:
+        existing = conn.execute("SELECT status FROM cases WHERE case_id = ?", (case_id,)).fetchone()
+
+        if existing and existing["status"] == "completed":
+            return False, "This case is completed and its signed decision cannot be modified."
+
+        json_fields = {
+            "transactions_json", "fx_state_json", "rules_config_json", "analysed_json",
+            "pending_json", "final_report_json", "officer_notes_json", "review_state_json",
+            "cosign_json",
         }
-        if other_classified:
-            st.markdown("**Additionally classified jurisdictions:**")
-            for country_lower, classification in list(other_classified.items()):
-                display_name = country_lower.title()
-                fatf_status = fatf_reference.get_fatf_status(display_name)
-                col_a, col_b = st.columns([5, 1])
-                with col_a:
-                    st.markdown(f"`{display_name}` \u2014 **{classification}** *(FATF: {fatf_status})*")
-                with col_b:
-                    if st.button("\u2715", key=f"remove_other_{country_lower}"):
-                        del st.session_state.country_classifications[country_lower]
-                        st.rerun()
+        columns, values = [], []
+        for key, value in fields.items():
+            columns.append(key)
+            values.append(json.dumps(value) if key in json_fields else value)
 
-    st.session_state.rules_config["country_classifications"] = st.session_state.country_classifications
-
-    with st.expander("FATF June 2026 reference data"):
-        st.caption(
-            "Regulatory reference information only \u2014 FATF status never automatically determines "
-            "this institution's classification (see panels above)."
-        )
-        st.markdown(f"**FATF Data:** June 2026")
-        st.markdown(f"**Source:** FATF (fatf-gafi.org)")
-        st.markdown(f"**Call for Action (\"black list\"):** {', '.join(fatf_reference.FATF_CALL_FOR_ACTION)}")
-        st.markdown(f"**Increased Monitoring (\"grey list\", {len(fatf_reference.FATF_INCREASED_MONITORING)} jurisdictions):**")
-        st.caption(", ".join(fatf_reference.FATF_INCREASED_MONITORING))
-        st.caption(f"Last successful update: {fatf_reference.FATF_VERIFIED_AT} (verified against FATF's {fatf_reference.FATF_PUBLICATION_DATE} publication)")
-
-        if st.button("\U0001F504 Refresh FATF Data"):
-            with st.spinner("Checking FATF's site..."):
-                result = fatf_reference.refresh_fatf_data()
-            st.session_state.fatf_check_result = result
-
-        if st.session_state.fatf_check_result:
-            r = st.session_state.fatf_check_result
-            if r["status"] == "current":
-                st.success(f"\u2705 Current \u2014 {r['message']}")
-            else:
-                st.warning(f"\u26A0\uFE0F FATF update unavailable. Last successfully cached FATF data is being used. {r['message']}")
-            st.caption(f"Last check attempt: {r.get('checked_at', 'n/a')}")
-
-st.title("\U0001F6E1\uFE0F AML/KYC Compliance Flagging Agent")
-st.caption(
-    "A LangGraph-orchestrated agent that normalizes multi-currency transactions to a USD "
-    "baseline, scores them across four risk categories, and pauses at a human oversight "
-    "checkpoint before any compliance report is produced."
-)
-
-with st.expander("\u2139\uFE0F Agent architecture (click to expand)"):
-    st.markdown("""
-    This agent is orchestrated as an explicit **LangGraph state graph**, not a
-    linear script:
-
-    ```
-    START -> normalize -> analyse -> human_review (interrupt) -> output -> END
-    ```
-
-    - **normalize**: converts every transaction to its USD equivalent (the
-      fixed AML baseline currency) using the FX rates configured in the
-      sidebar. Original amount/currency are always preserved.
-    - **analyse**: runs the AML rules engine (with your sidebar-configured
-      thresholds and country classifications) and produces a risk score per
-      transaction, broken into Customer / Transaction / Geographic / Behavioural risk.
-    - **human_review**: calls LangGraph's `interrupt()`. Execution genuinely
-      **pauses** here - the graph will not proceed to `output` until a
-      compliance officer supplies a decision for every flagged transaction.
-    - **output**: resumes once decisions are supplied, merges them into the
-      final report and timestamped audit trail.
-
-    No transaction is ever auto-reported - the graph structurally cannot
-    reach `output` for a flagged transaction without a human decision, and
-    the AI never autonomously determines a transaction is illegal.
-    """)
-
-with st.expander("\U0001F4DC AML/CFT Regulatory Guidelines (Zimbabwe)"):
-    st.caption(
-        "The rules in this agent are grounded in Zimbabwe's AML/CFT regulatory "
-        "framework, summarised below - the REGULATORY BASELINE. Institutional "
-        "thresholds configured in the sidebar are separate, institution-specific "
-        "risk parameters, not a restatement of this baseline."
-    )
-    for item in regulatory_watch.STATIC_FRAMEWORK:
-        with st.container(border=True):
-            title_line = f"**{item['title']}**  \u2014  *{item['role']}*"
-            st.markdown(title_line)
-            st.caption(item["note"])
-            if item.get("url"):
-                st.markdown(f"[Source document]({item['url']})")
-
-    st.divider()
-    st.markdown("**FIU Zimbabwe sector-specific guidelines**")
-    st.caption(
-        f"Catalogued manually as of {regulatory_watch.FIU_SECTOR_GUIDELINES_DATE} "
-        "(FIU's site has shown intermittent availability, so this list is not "
-        "live-checked - confirm directly at fiu.co.zw/index.php/guidelines/ before filing)."
-    )
-    for title in regulatory_watch.FIU_SECTOR_GUIDELINES:
-        st.markdown(f"- {title}")
-
-    st.divider()
-    st.markdown("**Live check: Reserve Bank of Zimbabwe guideline list**")
-    st.caption(
-        f"Bundled snapshot last taken {regulatory_watch.SNAPSHOT_DATE}. "
-        "This checks whether the RBZ has published new/renamed guidelines since then - "
-        "it does not read or summarise their content, and it only covers the RBZ's own "
-        "guideline page (not FIU's, above)."
-    )
-    if st.button("\U0001F504 Check RBZ site for updates now"):
-        with st.spinner("Fetching the live RBZ guidelines page..."):
-            result = regulatory_watch.check_for_updates()
-        if result["status"] == "error":
-            st.warning(f"\u26A0\uFE0F Live check failed: {result['message']} Falling back to the bundled snapshot above.")
+        now = _now()
+        if existing:
+            set_clause = ", ".join(f"{c} = ?" for c in columns)
+            conn.execute(
+                f"UPDATE cases SET {set_clause}, updated_at = ? WHERE case_id = ?",
+                values + [now, case_id],
+            )
         else:
-            st.success(f"Checked at {result['checked_at']} \u2014 {result['total_found']} guideline documents found on the live RBZ page.")
-            if result["new_or_changed"]:
-                st.warning("\U0001F195 Possibly new or renamed since the bundled snapshot \u2014 review manually:")
-                for title in result["new_or_changed"]:
-                    st.markdown(f"- {title}")
-            else:
-                st.info("No new guideline titles detected since the bundled snapshot.")
-
-# ---------------------------------------------------------------------------
-# STEP 1: READ INPUT
-# ---------------------------------------------------------------------------
-st.header("Step 1: Load transaction data")
-st.caption("Optional `currency` column accepted (USD/ZAR/ZiG) - if absent, all transactions are treated as USD.")
-
-col1, col2 = st.columns([2, 1])
-with col1:
-    uploaded_file = st.file_uploader("Upload transaction CSV", type=["csv"])
-with col2:
-    use_sample = st.button("Use sample data instead", use_container_width=True)
-
-required_cols = {
-    "transaction_id", "customer_id", "date", "amount",
-    "counterparty_country", "transaction_type", "customer_risk_profile"
-}
-
-if uploaded_file is not None:
-    st.session_state.raw_df = pd.read_csv(uploaded_file)
-elif use_sample:
-    st.session_state.raw_df = pd.read_csv("sample_transactions.csv")
-
-raw_df = st.session_state.raw_df
-
-if raw_df is not None:
-    missing = required_cols - set(raw_df.columns)
-    if missing:
-        st.error(f"Uploaded file is missing required columns: {', '.join(missing)}")
-    else:
-        st.success(f"Loaded {len(raw_df)} transactions.")
-        st.dataframe(raw_df.head(10), use_container_width=True)
-
-        # Determine which currencies are present and whether all have a resolved rate
-        present_currencies = sorted(raw_df["currency"].str.upper().str.replace("ZIG", "ZWG").unique().tolist()) if "currency" in raw_df.columns else ["USD"]
-        missing_rates = [c for c in present_currencies if c not in st.session_state.fx_rates]
-
-        if missing_rates:
-            st.error(
-                f"\u26A0\uFE0F Missing FX rate for: {', '.join(missing_rates)}. "
-                f"Set a live or manual rate in the sidebar's Currency & FX Normalization panel before running analysis."
+            columns = ["case_id", "officer_id", "created_at", "updated_at"] + columns
+            values = [case_id, officer_id, now, now] + values
+            placeholders = ", ".join("?" for _ in columns)
+            conn.execute(
+                f"INSERT INTO cases ({', '.join(columns)}) VALUES ({placeholders})", values
             )
+    return True, "Case saved."
 
-        if st.button("\u25B6 Run compliance analysis", type="primary", disabled=bool(missing_rates)):
-            with st.spinner("Agent normalizing currencies and analysing transactions..."):
-                st.session_state.thread_id = str(uuid.uuid4())  # fresh run each time
-                st.session_state.audit_trail = []
-                st.session_state.case_id = case_store.generate_case_id()
-                result = run_pipeline(
-                    graph, raw_df.to_dict("records"), st.session_state.thread_id,
-                    rules_config=st.session_state.rules_config,
-                    fx_rates=st.session_state.fx_rates, fx_sources=st.session_state.fx_sources,
-                )
-            if result["status"] == "fx_error":
-                st.error(f"\u26A0\uFE0F Missing FX rate for: {', '.join(result['missing_currencies'])}. No transaction was evaluated - fix rates in the sidebar and retry.")
-                st.session_state.case_id = None
-            elif result["status"] == "awaiting_review":
-                st.session_state.pipeline_status = "awaiting_review"
-                st.session_state.pending_transactions = result["pending_transactions"]
-                st.session_state.final_report = None
-                case_store.save_case(
-                    st.session_state.case_id, officer["officer_id"],
-                    thread_id=st.session_state.thread_id,
-                    transactions_json=raw_df.to_dict("records"),
-                    fx_state_json={"rates": st.session_state.fx_rates, "sources": st.session_state.fx_sources},
-                    rules_config_json=st.session_state.rules_config,
-                    pending_json=result["pending_transactions"],
-                    workflow_node="awaiting_review",
-                    status="in_progress",
-                    risk_summary=f"{len(result['pending_transactions'])} transaction(s) awaiting review",
-                )
-                case_store.append_audit(st.session_state.case_id, officer["officer_id"], officer["full_name"],
-                                         "ANALYSIS COMPLETE", previous_status=None, new_status="in_progress")
-            else:
-                st.session_state.pipeline_status = "complete"
-                st.session_state.final_report = result["final_report"]
-            st.rerun()
+
+def load_case(case_id):
+    """Returns the case as a dict with JSON fields decoded, or None."""
+    with get_conn() as conn:
+        row = conn.execute("SELECT * FROM cases WHERE case_id = ?", (case_id,)).fetchone()
+    if row is None:
+        return None
+    case = dict(row)
+    for key in ["transactions_json", "fx_state_json", "rules_config_json", "analysed_json",
+                "pending_json", "final_report_json", "officer_notes_json", "review_state_json",
+                "cosign_json"]:
+        if case.get(key):
+            case[key.replace("_json", "")] = json.loads(case[key])
+        else:
+            case[key.replace("_json", "")] = None
+    return case
+
+
+def list_unfinished_cases(officer_id):
+    """Cases belonging to this officer that are still directly resumable
+    by them (status='in_progress'). Deliberately excludes 'completed' AND
+    'pending_cosign' cases - a case awaiting a second officer's
+    co-signature must not be resumable through the normal review flow,
+    or an autosave during that resume could silently revert its
+    pending_cosign state. See list_own_pending_cosign_cases() for a
+    read-only view of those instead.
+    Excludes any row with a missing/empty case_id - such a row can never
+    pass case_belongs_to_officer() (SQLite treats NULL != NULL, so it
+    would always deny access, even to its own officer_id), so it must
+    never be shown as resumable in the first place. save_case() now
+    refuses to create these going forward; this filter also hides any
+    that already exist from before that guard was added."""
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT case_id, workflow_node, status, risk_summary, updated_at FROM cases "
+            "WHERE officer_id = ? AND status = 'in_progress' "
+            "AND case_id IS NOT NULL AND TRIM(case_id) != '' "
+            "ORDER BY updated_at DESC",
+            (officer_id,),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def list_own_pending_cosign_cases(officer_id):
+    """Read-only view for an officer to see their OWN cases currently
+    awaiting a second officer's co-signature - informational only, no
+    resume action, since only a DIFFERENT officer can act on these."""
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT case_id, cosign_json, updated_at FROM cases "
+            "WHERE officer_id = ? AND status = 'pending_cosign' ORDER BY updated_at DESC",
+            (officer_id,),
+        ).fetchall()
+    results = []
+    for r in rows:
+        d = dict(r)
+        d["cosign"] = json.loads(d["cosign_json"]) if d.get("cosign_json") else {}
+        results.append(d)
+    return results
+
+
+def case_belongs_to_officer(case_id, officer_id) -> bool:
+    """Authorization check - MUST be called before ever restoring a case
+    into a session, so an officer can never resume someone else's case."""
+    with get_conn() as conn:
+        row = conn.execute("SELECT officer_id FROM cases WHERE case_id = ?", (case_id,)).fetchone()
+    return row is not None and row["officer_id"] == officer_id
+
+
+def mark_case_completed(case_id, officer_id, officer_name, decision_summary):
+    """Finalizes a case. After this call, save_case() will refuse further
+    modification of this case's fields - see save_case()'s docstring."""
+    with get_conn() as conn:
+        conn.execute(
+            "UPDATE cases SET status = 'completed', updated_at = ? WHERE case_id = ?",
+            (_now(), case_id),
+        )
+    append_audit(case_id, officer_id, officer_name, "SIGN & COMPLETE DECISION",
+                 previous_status="in_progress", new_status="completed", decision=decision_summary)
+
+
+def append_audit(case_id, officer_id, officer_name, action, previous_status=None, new_status=None, decision=None):
+    with get_conn() as conn:
+        conn.execute(
+            "INSERT INTO audit_log (case_id, officer_id, officer_name, action, previous_status, "
+            "new_status, decision, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (case_id, officer_id, officer_name, action, previous_status, new_status, decision, _now()),
+        )
+
+
+def get_audit_trail(case_id):
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT * FROM audit_log WHERE case_id = ? ORDER BY timestamp ASC", (case_id,)
+        ).fetchall()
+    return [dict(r) for r in rows]
+
 
 # ---------------------------------------------------------------------------
-# STEP 2-3: RISK ANALYSIS SUMMARY + DASHBOARD
+# SECURITY ALERTS - persistent threshold-breach monitoring
 # ---------------------------------------------------------------------------
-def render_risk_breakdown(txn):
-    """Render the Customer/Transaction/Geographic/Behavioural score bars + rule list + full audit fields."""
-    cat_scores = txn.get("category_scores", {})
-    st.caption("Overall Risk Score = Customer Risk + Transaction Risk + Geographic Risk + Behavioural Risk")
-    cols = st.columns(4)
-    for i, cat in enumerate(CATEGORIES):
-        with cols[i]:
-            st.metric(cat, cat_scores.get(cat, 0))
 
-    with st.container(border=True):
-        st.markdown("**Currency & Jurisdiction Audit Trail**")
-        oc = txn.get("original_currency", "USD")
-        oa = txn.get("original_amount", txn.get("amount"))
-        st.markdown(
-            f"Original Amount: **{oc} {oa:,.2f}**  |  USD Equivalent: **${txn.get('usd_equivalent', txn.get('amount')):,.2f}**  \n"
-            f"FX Rate: 1 {oc} = {txn.get('usd_exchange_rate', 1.0):.6f} USD "
-            f"({txn.get('fx_rate_source', 'Fixed')}, {txn.get('fx_rate_timestamp', '') or 'n/a'})  \n"
-            f"AML Baseline: **USD**  |  Conversion Status: {txn.get('fx_conversion_status', 'n/a')}"
+def record_security_alert(case_id, officer_id, transaction_id, customer_id, amount_usd, threshold_usd, alert_type="Threshold exceeded"):
+    """Persist a threshold alert once per case/transaction."""
+    with get_conn() as conn:
+        existing = conn.execute(
+            "SELECT id FROM security_alerts WHERE case_id = ? AND transaction_id = ? AND alert_type = ?",
+            (case_id, transaction_id, alert_type),
+        ).fetchone()
+        if existing:
+            return existing["id"]
+        cur = conn.execute(
+            "INSERT INTO security_alerts (case_id, officer_id, transaction_id, customer_id, amount_usd, threshold_usd, alert_type, triggered_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (case_id, officer_id, transaction_id, customer_id, float(amount_usd), float(threshold_usd), alert_type, _now()),
         )
-        country = txn.get("counterparty_country", "")
-        classification = st.session_state.country_classifications.get(country.lower(), "Not classified")
-        fatf_status = fatf_reference.get_fatf_status(country)
-        st.markdown(
-            f"Jurisdiction: **{country}**  |  FATF Status: **{fatf_status}**  |  "
-            f"Institutional Classification: **{classification}**"
+        return cur.lastrowid
+
+
+def list_security_alerts(officer_id=None, limit=100):
+    """Return newest threshold alerts, optionally limited to one officer."""
+    with get_conn() as conn:
+        if officer_id:
+            rows = conn.execute(
+                "SELECT * FROM security_alerts WHERE officer_id = ? ORDER BY triggered_at DESC, id DESC LIMIT ?",
+                (officer_id, int(limit)),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM security_alerts ORDER BY triggered_at DESC, id DESC LIMIT ?",
+                (int(limit),),
+            ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def acknowledge_security_alert(alert_id, officer_id, officer_name):
+    """Acknowledge an alert and record the acknowledgement in the audit log."""
+    with get_conn() as conn:
+        row = conn.execute("SELECT * FROM security_alerts WHERE id = ?", (alert_id,)).fetchone()
+        if row is None:
+            return False, "Security alert not found."
+        if row["acknowledged_by"]:
+            return False, "This security alert has already been acknowledged."
+        conn.execute(
+            "UPDATE security_alerts SET acknowledged_by = ?, acknowledged_at = ? WHERE id = ?",
+            (officer_id, _now(), alert_id),
         )
-
-    st.markdown("**AML Rules Triggered**")
-    triggered = txn.get("triggered_rules", [])
-    if not triggered:
-        st.markdown(f"{SEVERITY_ICON['Low']} Customer normally has low-risk activity \u2014 no rules triggered")
-    else:
-        for r in triggered:
-            icon = SEVERITY_ICON.get(r["severity"], "")
-            st.markdown(f"{icon} **{r['label']}** ({r['category']}) \u2014 {r['reason']}")
-
-
-def render_call_for_action_banner(txn):
-    """Prominent warning when a transaction involves an active FATF Call for
-    Action jurisdiction. Never claims the transaction is illegal - flags it
-    for human compliance review per the agent's risk-based-approach design."""
-    geo_triggers = [r for r in txn.get("triggered_rules", []) if r["label"] == "FATF High-Risk Jurisdiction \u2014 Call for Action"]
-    if not geo_triggers:
-        return
-    oc = txn.get("original_currency", "USD")
-    oa = txn.get("original_amount", txn.get("amount"))
-    st.error(
-        f"\u26A0\uFE0F **HIGH GEOGRAPHIC RISK \u2014 FATF CALL FOR ACTION**\n\n"
-        f"**Country:** {txn.get('counterparty_country', '')}  \n"
-        f"**FATF Status:** Call for Action  \n"
-        f"**Transaction:** {txn['transaction_id']}  \n"
-        f"**Original Amount:** {oc} {oa:,.2f}  \n"
-        f"**Original Currency:** {oc}  \n"
-        f"**USD Equivalent:** ${txn.get('usd_equivalent', txn.get('amount')):,.2f}  \n"
-        f"**Customer Risk Profile:** {txn.get('customer_risk_profile', 'n/a')}  \n"
-        f"**AML Rules Triggered:** {'; '.join(r['label'] for r in txn.get('triggered_rules', []))}  \n\n"
-        f"**Recommended action:** Enhanced compliance review required according to institutional policy. "
-        f"This agent flags the transaction for human compliance review and does not determine that it is illegal."
+    append_audit(
+        row["case_id"], officer_id, officer_name, "SECURITY ALERT ACKNOWLEDGED",
+        decision=f"{row['transaction_id']}: {row['alert_type']} - USD {row['amount_usd']:,.2f} >= USD {row['threshold_usd']:,.2f}"
     )
+    return True, "Security alert acknowledged."
 
 
-def render_dashboard(all_txns):
-    """Executive KPI cards + charts summarising the whole flagged population (all in USD)."""
-    flagged = [t for t in all_txns if t["risk_bucket"] in ("High", "Medium")]
-    flagged_amount_usd = sum(t["amount"] for t in flagged)
-    avg_score = (sum(t["risk_score"] for t in flagged) / len(flagged)) if flagged else 0
-    pct_review = (len(flagged) / len(all_txns) * 100) if all_txns else 0
+# ---------------------------------------------------------------------------
+# TWO-PERSON SIGN-OFF (maker-checker) for High/Critical risk escalations.
+#
+# When a transaction is escalated to SAR filing AND its risk bucket is
+# High, the case does NOT complete on the first officer's signature alone.
+# It moves to status='pending_cosign' and waits for a SECOND, DIFFERENT
+# officer (with an appropriately senior role, enforced by app.py before
+# calling record_second_signature) to co-sign. Only once every such
+# transaction in the case has a second signature does the case become
+# 'completed' - at which point save_case()'s existing completed-lock
+# takes over exactly as it does for a single-signature case.
+# ---------------------------------------------------------------------------
 
-    k1, k2, k3 = st.columns(3)
-    k1.metric("Total value flagged (USD)", f"${flagged_amount_usd:,.0f}")
-    k2.metric("Avg. score (flagged)", f"{avg_score:.0f}")
-    k3.metric("% requiring review", f"{pct_review:.0f}%")
-
-    st.caption("Risk distribution")
-    bucket_counts = pd.Series([t["risk_bucket"] for t in all_txns]).value_counts()
-    st.bar_chart(bucket_counts)
-
-    st.caption("Most frequently triggered AML rules (flagged transactions)")
-    rule_labels = [r["label"] for t in flagged for r in t.get("triggered_rules", []) if r["weight"] > 0]
-    if rule_labels:
-        rule_counts = pd.Series(rule_labels).value_counts()
-        st.bar_chart(rule_counts)
-    else:
-        st.caption("No rules triggered.")
-
-    if any(t.get("original_currency", "USD") != "USD" for t in all_txns):
-        st.caption("Currency mix in this batch:")
-        cur_counts = pd.Series([t.get("original_currency", "USD") for t in all_txns]).value_counts()
-        st.bar_chart(cur_counts)
-
-
-if st.session_state.pipeline_status in ("awaiting_review", "complete"):
-    all_txns = (
-        st.session_state.pending_transactions
-        if st.session_state.pipeline_status == "awaiting_review"
-        else st.session_state.final_report
-    )
-    total = len(st.session_state.raw_df) if st.session_state.raw_df is not None else len(all_txns)
-    high = sum(1 for t in all_txns if t["risk_bucket"] == "High")
-    med = sum(1 for t in all_txns if t["risk_bucket"] == "Medium")
-
-    st.header("Step 2-3: Agent risk analysis")
-    st.caption("All figures below are USD equivalents - the fixed AML baseline currency.")
-
-    m1, m2, m3 = st.columns(3)
-    m1.metric("Total transactions", total)
-    m2.metric("\U0001F534 High risk", high)
-    m3.metric("\U0001F7E0 Medium risk", med)
-
-    with st.expander("\U0001F4CA Executive dashboard", expanded=True):
-        render_dashboard(all_txns)
-
-    # -----------------------------------------------------------------
-    # STEP 4: HUMAN OVERSIGHT CHECKPOINT (graph is paused via interrupt)
-    # -----------------------------------------------------------------
-    if st.session_state.pipeline_status == "awaiting_review":
-        st.header("Step 4: Human Oversight Checkpoint")
-        st.info(
-            "\u23F8\uFE0F The agent graph is **paused** at the human_review node. It will not "
-            "produce Step 5 output until you record a decision for every transaction below. "
-            "This agent flags transactions and provides evidence for review - it does not "
-            "determine that any transaction is illegal."
-        )
-
-        decisions = {}
-        for txn in st.session_state.pending_transactions:
-            badge = "\U0001F534" if txn["risk_bucket"] == "High" else "\U0001F7E0"
-            oc = txn.get("original_currency", "USD")
-            oa = txn.get("original_amount", txn.get("amount"))
-            with st.container(border=True):
-                st.markdown(
-                    f"{badge} **{txn['transaction_id']}** \u2014 Customer `{txn['customer_id']}` \u2014 "
-                    f"{oc} {oa:,.2f} (USD equivalent: ${txn['amount']:,.2f}) "
-                    f"\u2014 {txn['date']} \u2014 **Overall risk score: {txn['risk_score']}**"
-                )
-                render_call_for_action_banner(txn)
-                render_risk_breakdown(txn)
-
-                with st.expander("\U0001F4DD Draft SAR narrative"):
-                    st.caption("System-composed first draft from this transaction's own facts - no external AI service, no API key. Review and edit before use.")
-                    narrative_key = f"sar_narrative_{txn['transaction_id']}"
-                    if st.button("Generate draft narrative", key=f"gen_{narrative_key}"):
-                        narrative, err = sar_narrative.generate_sar_narrative(txn)
-                        st.session_state[narrative_key] = narrative
-                    if st.session_state.get(narrative_key):
-                        st.text_area("Draft (editable)", value=st.session_state[narrative_key], height=180, key=f"edit_{narrative_key}")
-
-                if txn["risk_bucket"] == "High":
-                    st.caption("\u2139\uFE0F If escalated to SAR filing, this High-risk transaction will require a second, senior officer's co-signature before the case closes.")
-
-                col_a, col_b, col_c = st.columns([1, 1, 2])
-                with col_a:
-                    status = st.selectbox(
-                        "Decision",
-                        ["Pending", "Approve (false positive)", "Escalate to SAR filing", "Dismiss - insufficient grounds"],
-                        key=f"decision_{txn['transaction_id']}"
-                    )
-                with col_b:
-                    reviewer = officer["full_name"]  # never manually typed - attached from the authenticated session
-                    st.markdown(f"**Reviewer:**  \n{reviewer}")
-                with col_c:
-                    notes = st.text_input("Notes (optional)", key=f"notes_{txn['transaction_id']}")
-
-                decisions[txn["transaction_id"]] = {"status": status, "reviewer": reviewer, "notes": notes}
-
-        still_pending = sum(1 for d in decisions.values() if d["status"] == "Pending")
-        if still_pending > 0:
-            st.warning(f"\u26A0\uFE0F {still_pending} transaction(s) still marked Pending. The agent will remain paused until every transaction has a decision.")
-
-        # Autosave progress (every transaction's current decision + notes)
-        # on every rerun - i.e. every time the officer changes a decision
-        # dropdown for ANY transaction, the full current state of ALL
-        # transactions is re-persisted, not just the one just touched. This
-        # does NOT sign/complete the case, only checkpoints where the
-        # officer currently stands.
-        case_store.save_case(
-            st.session_state.case_id, officer["officer_id"],
-            officer_notes_json={tid: d["notes"] for tid, d in decisions.items()},
-            review_state_json=decisions,
-            workflow_node="awaiting_review", status="in_progress",
-        )
-        reviewed_count = sum(1 for d in decisions.values() if d["status"] != "Pending")
-        save_col1, save_col2 = st.columns([3, 1])
-        with save_col1:
-            st.caption(f"\U0001F4BE Progress auto-saved \u2014 {reviewed_count}/{len(decisions)} transaction(s) have a recorded decision so far.")
-        with save_col2:
-            if st.button("\U0001F4BE Save progress now"):
-                st.success("Saved.")
-
-        if st.button("\u2705 CONFIRM & SIGN DECISION", type="primary", disabled=(still_pending > 0)):
-            reviewed_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            for txn_id, d in decisions.items():
-                d["reviewed_at"] = reviewed_at
-                st.session_state.audit_trail.append({
-                    "transaction_id": txn_id, "status": d["status"],
-                    "reviewer": d["reviewer"], "notes": d["notes"], "reviewed_at": reviewed_at,
-                })
-            with st.spinner("Resuming agent graph and generating final report..."):
-                result = resume_pipeline(graph, decisions, st.session_state.thread_id)
-            st.session_state.pipeline_status = "complete"
-            st.session_state.final_report = result["final_report"]
-
-            # Two-person sign-off (maker-checker): a High-risk transaction
-            # escalated to SAR filing does NOT complete the case on this
-            # officer's signature alone - it requires a second, different,
-            # senior officer to co-sign (see case_store.submit_for_cosign /
-            # record_second_signature). Every other decision in this batch
-            # still completes normally.
-            txn_by_id = {t["transaction_id"]: t for t in st.session_state.pending_transactions}
-            needs_cosign = {
-                tid: d for tid, d in decisions.items()
-                if d["status"] == "Escalate to SAR filing" and txn_by_id.get(tid, {}).get("risk_bucket") == "High"
-            }
-
-            if needs_cosign:
-                cosign_requirements = {
-                    tid: {
-                        "risk_bucket": "High",
-                        "decision": decisions[tid]["status"],
-                        "amount_usd": txn_by_id[tid]["amount"],
-                    }
-                    for tid in needs_cosign
-                }
-                case_store.submit_for_cosign(
-                    st.session_state.case_id, officer["officer_id"], officer["full_name"], cosign_requirements
-                )
-                st.warning(
-                    f"\U0001F58A\uFE0F {len(needs_cosign)} High-risk transaction(s) escalated to SAR filing require "
-                    f"a second, senior officer's co-signature. This case will remain open until that "
-                    f"co-signature is recorded - your decision and notes are saved."
-                )
-            else:
-                # No co-signature required - locks the case exactly as
-                # before (case_store.save_case() refuses any further edit
-                # once status='completed'), with one audit_log entry per
-                # decision, each attributed to the authenticated officer.
-                for txn_id, d in decisions.items():
-                    case_store.mark_case_completed(
-                        st.session_state.case_id, officer["officer_id"], officer["full_name"],
-                        decision_summary=f"{txn_id}: {d['status']}"
-                    )
-            st.rerun()
-
-    # -----------------------------------------------------------------
-    # STEP 5: OUTPUT
-    # -----------------------------------------------------------------
-    if st.session_state.pipeline_status == "complete":
-        st.header("Step 5: Output - Compliance report")
-        st.success("\u2705 Agent graph reached the output node \u2014 all flagged transactions have a recorded human decision.")
-
-        if st.session_state.case_id:
-            case_status = case_store.load_case(st.session_state.case_id)
-            if case_status and case_status["status"] == "pending_cosign":
-                st.warning(
-                    "\U0001F58A\uFE0F This case is NOT yet closed - one or more High-risk escalations here "
-                    "require a second, senior officer's co-signature. The report below reflects the AML "
-                    "pipeline's output; the case itself remains open in the audit trail until co-signed."
-                )
-            elif case_status and case_status["status"] == "completed":
-                st.caption("\u2705 This case is fully closed - all required signature(s) have been recorded.")
-
-        report_df = pd.DataFrame(st.session_state.final_report)
-        if "case_reference" not in report_df.columns:
-            report_df["case_reference"] = ""
-        # Defensive fallback: if this report came from a stale cached agent
-        # graph (e.g. a hot-reload that didn't rebuild the compiled
-        # LangGraph object) predating currency normalization, these columns
-        # could be missing. Fill them rather than crash, and surface a clear
-        # warning so the officer knows to reboot the app for a clean run.
-        fx_audit_defaults = {
-            "original_currency": "USD", "original_amount": report_df.get("amount", 0),
-            "usd_exchange_rate": 1.0, "fx_rate_source": "Unknown", "fx_rate_timestamp": "",
+def submit_for_cosign(case_id, officer_id, officer_name, cosign_requirements: dict):
+    """
+    Marks a case as awaiting second sign-off instead of completing it
+    outright. `cosign_requirements`: {transaction_id: {...any case-specific
+    detail worth keeping, e.g. "risk_bucket", "decision", "amount_usd"}}
+    for each transaction that requires a second signature. Each entry is
+    stamped with the first officer's identity and timestamp here.
+    """
+    now = _now()
+    stamped = {
+        tid: {
+            **details,
+            "first_officer_id": officer_id, "first_officer_name": officer_name,
+            "first_signed_at": now,
+            "second_officer_id": None, "second_officer_name": None, "second_signed_at": None,
         }
-        missing_fx_cols = [c for c in fx_audit_defaults if c not in report_df.columns]
-        if missing_fx_cols:
-            st.warning(
-                f"\u26A0\uFE0F This report is missing expected currency-audit fields ({', '.join(missing_fx_cols)}). "
-                "This usually means the app is running a stale cached session - please reboot the app "
-                "(Manage app \u2192 Reboot) and re-run the analysis for full auditability."
-            )
-            for col, default in fx_audit_defaults.items():
-                if col not in report_df.columns:
-                    report_df[col] = default
+        for tid, details in cosign_requirements.items()
+    }
+    save_case(case_id, officer_id, cosign_json=stamped, workflow_node="pending_cosign", status="pending_cosign")
+    append_audit(case_id, officer_id, officer_name, "SUBMIT FOR SECOND SIGN-OFF",
+                 previous_status="in_progress", new_status="pending_cosign",
+                 decision=f"{len(cosign_requirements)} transaction(s) require a second signature")
 
-        display_cols = [
-            "transaction_id", "customer_id", "original_currency", "original_amount",
-            "amount", "usd_exchange_rate", "fx_rate_source", "date",
-            "risk_bucket", "risk_score", "case_reference", "flag_reasons",
-            "review_status", "reviewed_by", "reviewer_notes",
-        ]
-        # Final safety net: even after the fillna pass above, only ever
-        # select columns that actually exist right now - this can never
-        # raise a KeyError regardless of what produced report_df.
-        display_cols = [c for c in display_cols if c in report_df.columns]
-        st.dataframe(
-            report_df[display_cols].rename(columns={"amount": "usd_equivalent"}),
-            use_container_width=True
+
+def list_pending_cosign(exclude_officer_id):
+    """Cases awaiting a second officer's co-signature, excluding cases
+    originated by exclude_officer_id - an officer can never see their own
+    escalation in a queue meant for approving someone else's decision
+    (also re-enforced inside record_second_signature as a hard check)."""
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT case_id, officer_id, risk_summary, cosign_json, updated_at FROM cases "
+            "WHERE status = 'pending_cosign' AND officer_id != ? ORDER BY updated_at ASC",
+            (exclude_officer_id,),
+        ).fetchall()
+    results = []
+    for r in rows:
+        d = dict(r)
+        d["cosign"] = json.loads(d["cosign_json"]) if d.get("cosign_json") else {}
+        results.append(d)
+    return results
+
+
+def record_second_signature(case_id, transaction_id, second_officer_id, second_officer_name):
+    """
+    Records a second officer's co-signature for one transaction in a case
+    awaiting sign-off. Refuses if the second officer is the same as the
+    first (no self-approval) or if this transaction was already
+    co-signed. Once every transaction in the case's cosign record has a
+    second signature, the case is automatically marked 'completed', at
+    which point save_case()'s normal lock protects it exactly like any
+    other completed case.
+
+    Returns (success: bool, message: str).
+    """
+    case = load_case(case_id)
+    if case is None:
+        return False, "Case not found."
+    if case["status"] != "pending_cosign":
+        return False, "This case is not currently awaiting a second sign-off."
+
+    cosign = case.get("cosign") or {}
+    entry = cosign.get(transaction_id)
+    if entry is None:
+        return False, "This transaction is not part of the case's co-signature requirements."
+    if entry["first_officer_id"] == second_officer_id:
+        return False, "The officer who escalated this transaction cannot also provide the second sign-off."
+    if entry.get("second_officer_id"):
+        return False, "This transaction already has a second signature recorded."
+
+    entry["second_officer_id"] = second_officer_id
+    entry["second_officer_name"] = second_officer_name
+    entry["second_signed_at"] = _now()
+    cosign[transaction_id] = entry
+
+    all_signed = all(e.get("second_officer_id") for e in cosign.values())
+    new_status = "completed" if all_signed else "pending_cosign"
+
+    with get_conn() as conn:
+        conn.execute(
+            "UPDATE cases SET cosign_json = ?, status = ?, updated_at = ? WHERE case_id = ?",
+            (json.dumps(cosign), new_status, _now(), case_id),
         )
-        st.caption(
-            "original_amount/original_currency are the values exactly as uploaded (never modified). "
-            "usd_equivalent is what every AML rule and threshold was evaluated against."
-        )
-
-        with st.expander("View full risk breakdown for a transaction"):
-            txn_id = st.selectbox("Select transaction", report_df["transaction_id"].tolist())
-            selected = next(t for t in st.session_state.final_report if t["transaction_id"] == txn_id)
-            render_call_for_action_banner(selected)
-            render_risk_breakdown(selected)
-
-        with st.expander("\U0001F50D Customer transaction history"):
-            customer_ids = sorted(report_df["customer_id"].unique().tolist())
-            selected_customer = st.selectbox("Select customer", customer_ids)
-            cust_df = report_df[report_df["customer_id"] == selected_customer].sort_values("date")
-            st.dataframe(
-                cust_df[["transaction_id", "date", "original_currency", "original_amount", "amount", "risk_bucket", "risk_score", "review_status"]].rename(columns={"amount": "usd_equivalent"}),
-                use_container_width=True
-            )
-            if len(cust_df) > 1:
-                chart_df = cust_df[["date", "amount", "risk_score"]].set_index("date")
-                c1, c2 = st.columns(2)
-                with c1:
-                    st.caption("USD equivalent over time")
-                    st.line_chart(chart_df["amount"])
-                with c2:
-                    st.caption("Risk score over time")
-                    st.line_chart(chart_df["risk_score"])
-            else:
-                st.caption("Only one transaction on record for this customer.")
-
-        audit_records = case_store.get_audit_trail(st.session_state.case_id) if st.session_state.case_id else []
-        if audit_records:
-            with st.expander("\U0001F4CB Timestamped audit trail (persistent)"):
-                audit_df = pd.DataFrame(audit_records)
-                st.dataframe(audit_df, use_container_width=True)
-                st.caption("Sourced from persistent storage, not session memory \u2014 survives a crash or restart.")
-                st.download_button(
-                    "\u2B07 Download audit trail (CSV)",
-                    data=audit_df.to_csv(index=False).encode("utf-8"),
-                    file_name=f"aml_audit_trail_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
-                    mime="text/csv",
-                )
-
-        dl1, dl2, dl3 = st.columns(3)
-        with dl1:
-            csv_out = report_df[display_cols + ["category_scores"]].rename(columns={"amount": "usd_equivalent"}).to_csv(index=False).encode("utf-8")
-            st.download_button(
-                "\u2B07 Download report (CSV)",
-                data=csv_out,
-                file_name=f"aml_compliance_report_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
-                mime="text/csv",
-                type="primary"
-            )
-        with dl2:
-            if st.button("\U0001F4CA Generate Excel report"):
-                with st.spinner("Building Excel workbook..."):
-                    excel_buf = BytesIO()
-                    with pd.ExcelWriter(excel_buf, engine="openpyxl") as writer:
-                        report_df[display_cols].rename(columns={"amount": "usd_equivalent"}).to_excel(
-                            writer, sheet_name="Compliance Report", index=False
-                        )
-                        if st.session_state.audit_trail:
-                            pd.DataFrame(st.session_state.audit_trail).to_excel(
-                                writer, sheet_name="Audit Trail", index=False
-                            )
-                    excel_bytes = excel_buf.getvalue()
-                st.download_button(
-                    "\u2B07 Download report (Excel)",
-                    data=excel_bytes,
-                    file_name=f"aml_compliance_report_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                )
-        with dl3:
-            if st.button("\U0001F4C4 Generate PDF report"):
-                with st.spinner("Building PDF..."):
-                    tmp_path = os.path.join(tempfile.gettempdir(), "aml_compliance_report.pdf")
-                    build_pdf(st.session_state.final_report, st.session_state.rules_config, tmp_path)
-                    with open(tmp_path, "rb") as f:
-                        pdf_bytes = f.read()
-                st.download_button(
-                    "\u2B07 Download report (PDF)",
-                    data=pdf_bytes,
-                    file_name=f"aml_compliance_report_{datetime.now().strftime('%Y%m%d_%H%M')}.pdf",
-                    mime="application/pdf",
-                )
-
-st.divider()
-st.caption(
-    "Educational prototype using simulated data only. Not connected to any live "
-    "banking system. Built for HBF2212 - Artificial Intelligence in Finance."
-)
+    append_audit(case_id, second_officer_id, second_officer_name, "SECOND SIGN-OFF (CO-SIGN)",
+                 previous_status="pending_cosign", new_status=new_status,
+                 decision=f"{transaction_id}: co-signed")
+    if all_signed:
+        append_audit(case_id, second_officer_id, second_officer_name, "CASE COMPLETED (ALL CO-SIGNATURES RECEIVED)",
+                     previous_status="pending_cosign", new_status="completed",
+                     decision="All required co-signatures received")
+    return True, "Co-signature recorded." + (" All required signatures received - case is now completed." if all_signed else " Awaiting further co-signature(s) on this case.")

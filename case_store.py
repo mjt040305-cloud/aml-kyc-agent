@@ -259,6 +259,59 @@ def get_audit_trail(case_id):
         ).fetchall()
     return [dict(r) for r in rows]
 
+# ---------------------------------------------------------------------------
+# SECURITY ALERTS - persistent threshold-breach monitoring
+# ---------------------------------------------------------------------------
+
+def record_security_alert(case_id, officer_id, transaction_id, customer_id, amount_usd, threshold_usd, alert_type="Threshold exceeded"):
+    """Persist a threshold alert once per case/transaction."""
+    with get_conn() as conn:
+        existing = conn.execute(
+            "SELECT id FROM security_alerts WHERE case_id = ? AND transaction_id = ? AND alert_type = ?",
+            (case_id, transaction_id, alert_type),
+        ).fetchone()
+        if existing:
+            return existing["id"]
+        cur = conn.execute(
+            "INSERT INTO security_alerts (case_id, officer_id, transaction_id, customer_id, amount_usd, threshold_usd, alert_type, triggered_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (case_id, officer_id, transaction_id, customer_id, float(amount_usd), float(threshold_usd), alert_type, _now()),
+        )
+        return cur.lastrowid
+
+
+def list_security_alerts(officer_id=None, limit=100):
+    """Return newest threshold alerts, optionally limited to one officer."""
+    with get_conn() as conn:
+        if officer_id:
+            rows = conn.execute(
+                "SELECT * FROM security_alerts WHERE officer_id = ? ORDER BY triggered_at DESC, id DESC LIMIT ?",
+                (officer_id, int(limit)),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM security_alerts ORDER BY triggered_at DESC, id DESC LIMIT ?",
+                (int(limit),),
+            ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def acknowledge_security_alert(alert_id, officer_id, officer_name):
+    """Acknowledge an alert and record the acknowledgement in the audit log."""
+    with get_conn() as conn:
+        row = conn.execute("SELECT * FROM security_alerts WHERE id = ?", (alert_id,)).fetchone()
+        if row is None:
+            return False, "Security alert not found."
+        if row["acknowledged_by"]:
+            return False, "This security alert has already been acknowledged."
+        conn.execute(
+            "UPDATE security_alerts SET acknowledged_by = ?, acknowledged_at = ? WHERE id = ?",
+            (officer_id, _now(), alert_id),
+        )
+    append_audit(
+        row["case_id"], officer_id, officer_name, "SECURITY ALERT ACKNOWLEDGED",
+        decision=f"{row['transaction_id']}: {row['alert_type']} - USD {row['amount_usd']:,.2f} >= USD {row['threshold_usd']:,.2f}"
+    )
+    return True, "Security alert acknowledged."
 
 # ---------------------------------------------------------------------------
 # TWO-PERSON SIGN-OFF (maker-checker) for High/Critical risk escalations.
