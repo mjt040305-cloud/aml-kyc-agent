@@ -918,8 +918,20 @@ if st.session_state.pipeline_status in ("awaiting_review", "complete"):
         else st.session_state.final_report
     )
     total = len(st.session_state.raw_df) if st.session_state.raw_df is not None else len(all_txns)
-    high = sum(1 for t in all_txns if t["risk_bucket"] == "High")
-    med = sum(1 for t in all_txns if t["risk_bucket"] == "Medium")
+    # Defensive: all_txns should always be a list of transaction dicts, but
+    # never let a malformed entry (e.g. from an unexpected upstream shape)
+    # crash the whole page - skip anything that isn't a proper dict rather
+    # than raising, and surface a clear warning so it's visible, not silent.
+    malformed = [t for t in all_txns if not isinstance(t, dict)]
+    if malformed:
+        st.error(
+            f"\u26A0\uFE0F {len(malformed)} of {len(all_txns)} transaction(s) came back in an unexpected format "
+            f"and were skipped from this summary - this points to a bug upstream in the pipeline, not just here."
+        )
+    valid_txns = [t for t in all_txns if isinstance(t, dict)]
+    all_txns = valid_txns  # every downstream use in this block (dashboard, tables, exports) now sees only well-formed entries
+    high = sum(1 for t in valid_txns if t.get("risk_bucket") == "High")
+    med = sum(1 for t in valid_txns if t.get("risk_bucket") == "Medium")
 
     st.header("Step 2-3: Agent risk analysis")
     st.caption("All figures below are USD equivalents - the fixed AML baseline currency.")
@@ -1050,7 +1062,7 @@ if st.session_state.pipeline_status in ("awaiting_review", "complete"):
             # senior officer to co-sign (see case_store.submit_for_cosign /
             # record_second_signature). Every other decision in this batch
             # still completes normally.
-            txn_by_id = {t["transaction_id"]: t for t in st.session_state.pending_transactions}
+            txn_by_id = {t["transaction_id"]: t for t in st.session_state.pending_transactions if isinstance(t, dict)}
             needs_cosign = {
                 tid: d for tid, d in decisions.items()
                 if d["status"] == "Escalate to SAR filing" and txn_by_id.get(tid, {}).get("risk_bucket") == "High"
@@ -1196,7 +1208,7 @@ if st.session_state.pipeline_status in ("awaiting_review", "complete"):
 
         with st.expander("View full risk breakdown for a transaction"):
             txn_id = st.selectbox("Select transaction", report_df["transaction_id"].tolist())
-            selected = next(t for t in st.session_state.final_report if t["transaction_id"] == txn_id)
+            selected = next(t for t in st.session_state.final_report if isinstance(t, dict) and t["transaction_id"] == txn_id)
             render_call_for_action_banner(selected)
             render_risk_breakdown(selected)
 
