@@ -52,6 +52,7 @@ import auth_db
 import case_store
 import sar_narrative
 import sar_filing_report
+import audio_alert
 
 st.set_page_config(page_title="AML/KYC Compliance Agent", page_icon="\U0001F6E1\uFE0F", layout="wide")
 
@@ -130,6 +131,7 @@ defaults = {
     # fatf_reference.FATF_INCREASED_MONITORING for the full eligible list).
     "watchlist_selected": ["Syria", "South Sudan", "Yemen"],
     "fatf_check_result": None,
+    "pending_sound_alert": None,  # list of transaction_ids to alert on, consumed once on next render
 }
 for k, v in defaults.items():
     if k not in st.session_state:
@@ -266,6 +268,16 @@ with st.sidebar:
         st.rerun()
     st.divider()
     st.header("\u2699\uFE0F Agent Configuration")
+
+    # -------------------- Sound alert toggle --------------------
+    if "sound_alerts_enabled" not in st.session_state:
+        st.session_state.sound_alerts_enabled = True
+    st.session_state.sound_alerts_enabled = st.checkbox(
+        "\U0001F50A Play a sound alert when a transaction breaches the structuring threshold",
+        value=st.session_state.sound_alerts_enabled,
+    )
+    st.caption("A UX convenience only - every transaction still goes through the full human review checkpoint regardless of this setting.")
+    st.divider()
 
     # -------------------- Institutional monitoring thresholds --------------------
     st.subheader("Institutional Monitoring Thresholds")
@@ -619,6 +631,19 @@ if raw_df is not None:
                 )
                 case_store.append_audit(st.session_state.case_id, officer["officer_id"], officer["full_name"],
                                          "ANALYSIS COMPLETE", previous_status=None, new_status="in_progress")
+
+                # Sound alert - the button click that got us here is about
+                # to trigger st.rerun() below, which would discard any
+                # widget (including st.audio) rendered in THIS pass before
+                # the browser ever sees it. So we only record which
+                # transactions breached the threshold here, and actually
+                # render+autoplay the tone on the very next render pass
+                # (see the top of the Step 2-3 section), where it's
+                # consumed and cleared immediately so it never replays on
+                # a later rerun (e.g. typing a review note).
+                breaching = [t for t in result["pending_transactions"] if audio_alert.transaction_breaches_threshold(t)]
+                if breaching and st.session_state.sound_alerts_enabled:
+                    st.session_state.pending_sound_alert = [t["transaction_id"] for t in breaching]
             else:
                 st.session_state.pipeline_status = "complete"
                 st.session_state.final_report = result["final_report"]
@@ -730,6 +755,12 @@ if st.session_state.pipeline_status in ("awaiting_review", "complete"):
 
     st.header("Step 2-3: Agent risk analysis")
     st.caption("All figures below are USD equivalents - the fixed AML baseline currency.")
+
+    if st.session_state.pending_sound_alert:
+        alert_ids = st.session_state.pending_sound_alert
+        st.session_state.pending_sound_alert = None  # consume immediately - never replays on a later rerun
+        st.warning(f"\U0001F6A8 {len(alert_ids)} transaction(s) breach the institutional structuring threshold: {', '.join(alert_ids)}")
+        st.audio(audio_alert.generate_alert_tone(), format="audio/wav", autoplay=True)
 
     m1, m2, m3 = st.columns(3)
     m1.metric("Total transactions", total)
