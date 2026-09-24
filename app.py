@@ -72,7 +72,7 @@ if "authenticated_officer" not in st.session_state:
 
 if st.session_state.authenticated_officer is None:
     st.title("\U0001F6E1\uFE0F AML/KYC Compliance Agent \u2014 Officer Sign-In")
-    tab_login, tab_register = st.tabs(["Sign In", "Register New Account"])
+    tab_login, tab_register, tab_reset = st.tabs(["Sign In", "Register New Account", "Forgot Password?"])
 
     with tab_login:
         with st.form("login_form", clear_on_submit=True):
@@ -95,13 +95,39 @@ if st.session_state.authenticated_officer is None:
             role = st.selectbox("Role", ["Compliance Officer", "Senior Compliance Officer", "Compliance Manager"])
             pw1 = st.text_input("Password", type="password")
             pw2 = st.text_input("Confirm Password", type="password")
+            st.caption("Set a security question now so you can reset your password yourself later if you forget it.")
+            sec_question = st.selectbox("Security question", auth_db.SECURITY_QUESTIONS)
+            sec_answer = st.text_input("Your answer")
             reg_submitted = st.form_submit_button("Create Account", type="primary")
         if reg_submitted:
             if pw1 != pw2:
                 st.error("Passwords do not match.")
+            elif not sec_answer.strip():
+                st.error("A security answer is required so you can reset your password later.")
             else:
-                ok, msg = auth_db.register_officer(full_name, officer_id_input, email, pw1, role)
+                ok, msg = auth_db.register_officer(full_name, officer_id_input, email, pw1, role, sec_question, sec_answer)
                 (st.success if ok else st.error)(msg)
+
+    with tab_reset:
+        st.caption("Reset your password using the security question you set at registration \u2014 no email required.")
+        reset_id = st.text_input("Officer ID or Email", key="reset_id_lookup")
+        if reset_id:
+            question = auth_db.get_security_question(reset_id)
+            if question is None:
+                st.warning("No security question is on file for this account. Contact your administrator to reset your password.")
+            else:
+                with st.form("reset_form", clear_on_submit=True):
+                    st.markdown(f"**Security question:** {question}")
+                    reset_answer = st.text_input("Your answer")
+                    new_pw1 = st.text_input("New password", type="password")
+                    new_pw2 = st.text_input("Confirm new password", type="password")
+                    reset_submitted = st.form_submit_button("Reset Password", type="primary")
+                if reset_submitted:
+                    if new_pw1 != new_pw2:
+                        st.error("New passwords do not match.")
+                    else:
+                        ok, msg = auth_db.reset_password(reset_id, reset_answer, new_pw1)
+                        (st.success if ok else st.error)(msg)
 
     st.stop()
 
@@ -276,7 +302,7 @@ if recently_completed:
     with st.expander(f"\u2705 Your recently completed case(s) ({len(recently_completed)})"):
         st.caption("A co-signer has finished signing off on these. Click one to view its final report and generate any reports for it.")
         for c in recently_completed:
-            rcol1, rcol2 = st.columns([4, 1])
+            rcol1, rcol2, rcol3 = st.columns([4, 1, 1])
             with rcol1:
                 st.markdown(f"**{c['case_id']}** \u2014 {c['risk_summary'] or 'completed'} (closed {c['updated_at']})")
             with rcol2:
@@ -288,6 +314,12 @@ if recently_completed:
                     st.session_state.final_report = restored["final_report"]
                     st.session_state.pipeline_status = "complete"
                     st.rerun()
+            with rcol3:
+                if st.button("Remove", key=f"archive_completed_{c['case_id']}", help="Removes it from this list only - the signed case record and audit trail are never deleted."):
+                    ok, msg = case_store.archive_completed_case(c["case_id"], officer["officer_id"], officer["full_name"])
+                    (st.success if ok else st.error)(msg)
+                    if ok:
+                        st.rerun()
 
 if officer["role"] in SECOND_SIGNER_ROLES:
     cosign_queue = case_store.list_pending_cosign(officer["officer_id"])

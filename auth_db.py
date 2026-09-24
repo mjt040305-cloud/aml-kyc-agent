@@ -45,6 +45,15 @@ def get_conn():
         conn.close()
 
 
+SECURITY_QUESTIONS = [
+    "What was the name of your first school?",
+    "What is your mother's maiden name?",
+    "What was the make of your first car?",
+    "What city were you born in?",
+    "What is the name of your favourite childhood teacher?",
+]
+
+
 def init_auth_db():
     with get_conn() as conn:
         conn.execute("""
@@ -55,17 +64,36 @@ def init_auth_db():
                 password_hash TEXT NOT NULL,
                 salt TEXT NOT NULL,
                 role TEXT NOT NULL,
-                created_at TEXT NOT NULL
+                created_at TEXT NOT NULL,
+                security_question TEXT,
+                security_answer_hash TEXT,
+                security_answer_salt TEXT
             )
         """)
+        # Backward-compatible migration for accounts registered before the
+        # forgot-password feature existed - SQLite has no
+        # "ADD COLUMN IF NOT EXISTS", so attempt each and ignore if already present.
+        for stmt in [
+            "ALTER TABLE officers ADD COLUMN security_question TEXT",
+            "ALTER TABLE officers ADD COLUMN security_answer_hash TEXT",
+            "ALTER TABLE officers ADD COLUMN security_answer_salt TEXT",
+        ]:
+            try:
+                conn.execute(stmt)
+            except sqlite3.OperationalError:
+                pass
 
 
 def _hash_password(password: str, salt: bytes) -> str:
     return hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, 200_000).hex()
 
 
-def register_officer(full_name: str, officer_id: str, email: str, password: str, role: str):
-    """Create a new officer account. Returns (success: bool, message: str)."""
+def register_officer(full_name: str, officer_id: str, email: str, password: str, role: str,
+                      security_question: str = None, security_answer: str = None):
+    """Create a new officer account. Returns (success: bool, message: str).
+    security_question/security_answer are optional for backward compatibility,
+    but an account without them cannot use self-service password reset later -
+    the registration form should always collect them for new accounts."""
     if not all([full_name.strip(), officer_id.strip(), email.strip(), password, role.strip()]):
         return False, "All fields are required."
     if len(password) < 8:
@@ -74,17 +102,70 @@ def register_officer(full_name: str, officer_id: str, email: str, password: str,
     salt = secrets.token_bytes(16)
     pw_hash = _hash_password(password, salt)
 
+    answer_hash = answer_salt = None
+    if security_question and security_answer:
+        answer_salt = secrets.token_bytes(16)
+        # Normalize case/whitespace so the answer isn't unreasonably strict
+        answer_hash = _hash_password(security_answer.strip().lower(), answer_salt)
+
     with get_conn() as conn:
         try:
             conn.execute(
-                "INSERT INTO officers (officer_id, full_name, email, password_hash, salt, role, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO officers (officer_id, full_name, email, password_hash, salt, role, created_at, "
+                "security_question, security_answer_hash, security_answer_salt) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (officer_id.strip(), full_name.strip(), email.strip().lower(), pw_hash, salt.hex(), role.strip(),
-                 zim_now_str()),
+                 zim_now_str(), security_question, answer_hash, answer_salt.hex() if answer_salt else None),
             )
         except sqlite3.IntegrityError:
             return False, "An officer with this Officer ID or email already exists."
     return True, "Account created. You can now log in."
+
+
+def get_security_question(email_or_id: str):
+    """Returns the officer's security question string, or None if the
+    account has none set (e.g. registered before this feature existed) or
+    doesn't exist - callers should treat both cases the same (no self-service
+    reset possible) without revealing which one it is, to avoid leaking
+    whether an account exists."""
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT security_question FROM officers WHERE email = ? OR officer_id = ?",
+            (email_or_id.strip().lower(), email_or_id.strip()),
+        ).fetchone()
+    if row is None or not row["security_question"]:
+        return None
+    return row["security_question"]
+
+
+def reset_password(email_or_id: str, security_answer: str, new_password: str):
+    """
+    Self-service password reset via security question - no email/SMS
+    infrastructure required. Returns (success: bool, message: str).
+    """
+    if len(new_password) < 8:
+        return False, "New password must be at least 8 characters."
+
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM officers WHERE email = ? OR officer_id = ?",
+            (email_or_id.strip().lower(), email_or_id.strip()),
+        ).fetchone()
+        if row is None or not row["security_answer_hash"]:
+            return False, "No account found with a security question set up. Contact your administrator."
+
+        salt = bytes.fromhex(row["security_answer_salt"])
+        candidate_hash = _hash_password(security_answer.strip().lower(), salt)
+        if not secrets.compare_digest(candidate_hash, row["security_answer_hash"]):
+            return False, "Security answer is incorrect."
+
+        new_salt = secrets.token_bytes(16)
+        new_hash = _hash_password(new_password, new_salt)
+        conn.execute(
+            "UPDATE officers SET password_hash = ?, salt = ? WHERE officer_id = ?",
+            (new_hash, new_salt.hex(), row["officer_id"]),
+        )
+    return True, "Password reset successfully. You can now log in with your new password."
 
 
 def verify_login(email_or_id: str, password: str):

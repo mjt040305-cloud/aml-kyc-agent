@@ -67,6 +67,7 @@ def init_case_db():
                 review_state_json TEXT,
                 cosign_json TEXT,
                 sar_generated_by_json TEXT,
+                hidden_by_json TEXT,
                 workflow_node TEXT,
                 status TEXT NOT NULL DEFAULT 'in_progress',
                 risk_summary TEXT,
@@ -79,7 +80,8 @@ def init_case_db():
         # IF NOT EXISTS", so attempt each and ignore the error if it's
         # already there.
         for migration in ["ALTER TABLE cases ADD COLUMN cosign_json TEXT",
-                           "ALTER TABLE cases ADD COLUMN sar_generated_by_json TEXT"]:
+                           "ALTER TABLE cases ADD COLUMN sar_generated_by_json TEXT",
+                           "ALTER TABLE cases ADD COLUMN hidden_by_json TEXT"]:
             try:
                 conn.execute(migration)
             except sqlite3.OperationalError:
@@ -151,7 +153,7 @@ def save_case(case_id, officer_id, **fields):
         json_fields = {
             "transactions_json", "fx_state_json", "rules_config_json", "analysed_json",
             "pending_json", "final_report_json", "officer_notes_json", "review_state_json",
-            "cosign_json",
+            "cosign_json", "sar_generated_by_json", "hidden_by_json",
         }
         columns, values = [], []
         for key, value in fields.items():
@@ -184,7 +186,7 @@ def load_case(case_id):
     case = dict(row)
     for key in ["transactions_json", "fx_state_json", "rules_config_json", "analysed_json",
                 "pending_json", "final_report_json", "officer_notes_json", "review_state_json",
-                "cosign_json", "sar_generated_by_json"]:
+                "cosign_json", "sar_generated_by_json", "hidden_by_json"]:
         if case.get(key):
             case[key.replace("_json", "")] = json.loads(case[key])
         else:
@@ -242,14 +244,60 @@ def list_recently_completed_cases(officer_id, limit=5):
     a co-sign was pending on disappears from list_own_pending_cosign_cases()
     (it's no longer pending), the originating officer has no way to
     navigate back to it unless it happens to still be loaded in their
-    current browser session - this closes that gap."""
+    current browser session - this closes that gap.
+
+    Excludes cases this officer has archived from their own list (see
+    archive_completed_case) - archiving only hides a case from this view;
+    the underlying record, audit trail, and its visibility to other
+    officers (e.g. a co-signer) are completely unaffected."""
     with get_conn() as conn:
         rows = conn.execute(
-            "SELECT case_id, risk_summary, updated_at FROM cases "
+            "SELECT case_id, risk_summary, updated_at, hidden_by_json FROM cases "
             "WHERE officer_id = ? AND status = 'completed' ORDER BY updated_at DESC LIMIT ?",
-            (officer_id, limit),
+            (officer_id, limit * 3),  # over-fetch since some may be filtered out below
         ).fetchall()
-    return [dict(r) for r in rows]
+    results = []
+    for r in rows:
+        d = dict(r)
+        hidden_by = json.loads(d["hidden_by_json"]) if d.get("hidden_by_json") else []
+        if officer_id not in hidden_by:
+            results.append(d)
+        if len(results) >= limit:
+            break
+    return results
+
+
+def archive_completed_case(case_id, officer_id, officer_name):
+    """
+    Hides a completed case from THIS officer's own "recently completed"
+    list. This is NOT a delete: the case row, its final_report, its
+    cosign record, and its full audit_log entry are all left completely
+    untouched - a real compliance record cannot simply vanish once
+    signed, or the entire point of the two-person sign-off and audit
+    trail this app is built around would be defeated. Any other officer
+    who can see this case (e.g. a co-signer) is entirely unaffected by
+    one officer archiving it from their own list.
+
+    Returns (success: bool, message: str).
+    """
+    case = load_case(case_id)
+    if case is None:
+        return False, "Case not found."
+    if case["status"] != "completed":
+        return False, "Only fully completed cases can be archived from your list."
+
+    hidden_by = case.get("hidden_by") or []
+    if officer_id not in hidden_by:
+        hidden_by.append(officer_id)
+
+    with get_conn() as conn:
+        conn.execute(
+            "UPDATE cases SET hidden_by_json = ?, updated_at = ? WHERE case_id = ?",
+            (json.dumps(hidden_by), _now(), case_id),
+        )
+    append_audit(case_id, officer_id, officer_name, "REMOVED FROM OFFICER'S OWN LIST (archived, not deleted)",
+                 previous_status="completed", new_status="completed", decision=None)
+    return True, "Removed from your list. The case record and audit trail are unchanged."
 
 
 def case_belongs_to_officer(case_id, officer_id) -> bool:
