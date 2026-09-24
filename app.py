@@ -232,13 +232,43 @@ SECOND_SIGNER_ROLES = {"Senior Compliance Officer", "Compliance Manager"}
 own_pending_cosign = case_store.list_own_pending_cosign_cases(officer["officer_id"])
 if own_pending_cosign:
     with st.expander(f"\U0001F58A\uFE0F Your escalation(s) awaiting a second sign-off ({len(own_pending_cosign)})"):
-        st.caption("A different, senior officer must co-sign these before they close. No action needed from you.")
+        st.caption("A different, senior officer must co-sign these before they close. No action needed from you, unless you want to withdraw a request.")
         for c in own_pending_cosign:
             pending_txns = {tid: e for tid, e in c["cosign"].items() if not e.get("second_officer_id")}
             st.markdown(f"**{c['case_id']}** \u2014 {len(pending_txns)} transaction(s) still awaiting co-signature (updated {c['updated_at']})")
             for tid, e in pending_txns.items():
                 routed = e.get("assigned_officer_name")
                 st.caption(f"  {tid} \u2014 {'routed to ' + routed if routed else 'open to any qualifying officer'}")
+
+                cancel_key = f"show_cancel_{c['case_id']}_{tid}"
+                if not st.session_state.get(cancel_key):
+                    if st.button(f"\u2716 Cancel this request", key=f"cancelbtn_{c['case_id']}_{tid}"):
+                        st.session_state[cancel_key] = True
+                        st.rerun()
+                else:
+                    with st.form(key=f"cancelform_{c['case_id']}_{tid}"):
+                        st.caption(f"Withdraw the co-signature request for {tid} and record a new decision instead:")
+                        new_status = st.selectbox(
+                            "New decision", ["Approve (false positive)", "Dismiss - insufficient grounds"],
+                            key=f"newstatus_{c['case_id']}_{tid}",
+                        )
+                        cancel_notes = st.text_input("Notes (optional)", key=f"cancelnotes_{c['case_id']}_{tid}")
+                        confirm_col, back_col = st.columns(2)
+                        with confirm_col:
+                            confirmed = st.form_submit_button("\u2705 Confirm withdrawal")
+                        with back_col:
+                            cancelled_back = st.form_submit_button("Back")
+                    if confirmed:
+                        ok, msg = case_store.cancel_cosign_request(
+                            c["case_id"], tid, officer["officer_id"], officer["full_name"], new_status, cancel_notes
+                        )
+                        st.session_state.pop(cancel_key, None)
+                        (st.success if ok else st.error)(msg)
+                        if ok:
+                            st.rerun()
+                    if cancelled_back:
+                        st.session_state.pop(cancel_key, None)
+                        st.rerun()
 
 if officer["role"] in SECOND_SIGNER_ROLES:
     cosign_queue = case_store.list_pending_cosign(officer["officer_id"])
@@ -301,6 +331,7 @@ if my_cosigned_cases:
                 if sar_err:
                     st.error(sar_err)
                 else:
+                    case_store.mark_sar_generated(mc["case_id"], officer["officer_id"])
                     with open(result_path, "rb") as f:
                         sar_docx_bytes = f.read()
                     st.download_button(
@@ -310,6 +341,7 @@ if my_cosigned_cases:
                         mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
                         key=f"dl_sar_{mc['case_id']}",
                     )
+                    st.caption("This option will no longer appear on your next visit \u2014 the file above is your only chance to download it from this screen. Re-download from your own records if needed.")
         st.divider()
 
 
@@ -407,9 +439,10 @@ with st.sidebar:
             src = st.session_state.fx_sources.get(code)
             if src:
                 rate_val = st.session_state.fx_rates.get(code)
+                inverse = (1 / rate_val) if rate_val else 0
                 st.caption(
-                    f"FX Source: **{src['source']}**  |  FX Rate: 1 {code} = {rate_val:.6f} USD  |  "
-                    f"Last Updated: {src['timestamp'] or 'not yet set'}"
+                    f"FX Source: **{src['source']}**  |  FX Rate: 1 {code} = {rate_val:.6f} USD "
+                    f"(i.e. 1 USD = {inverse:,.4f} {code})  |  Last Updated: {src['timestamp'] or 'not yet set'}"
                 )
             else:
                 st.caption("\u26A0\uFE0F No rate set yet for this currency \u2014 required before analysis if present in your data.")
