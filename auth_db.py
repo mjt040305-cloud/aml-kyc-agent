@@ -20,6 +20,7 @@ import hashlib
 import secrets
 import os
 from datetime import datetime
+from tz_utils import zim_now_str
 from contextlib import contextmanager
 
 # On Streamlit Community Cloud this file lives on the app's local disk,
@@ -79,7 +80,7 @@ def register_officer(full_name: str, officer_id: str, email: str, password: str,
                 "INSERT INTO officers (officer_id, full_name, email, password_hash, salt, role, created_at) "
                 "VALUES (?, ?, ?, ?, ?, ?, ?)",
                 (officer_id.strip(), full_name.strip(), email.strip().lower(), pw_hash, salt.hex(), role.strip(),
-                 datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
+                 zim_now_str()),
             )
         except sqlite3.IntegrityError:
             return False, "An officer with this Officer ID or email already exists."

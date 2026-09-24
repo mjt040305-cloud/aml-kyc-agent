@@ -33,6 +33,7 @@ import sqlite3
 import json
 import os
 from datetime import datetime
+from tz_utils import zim_now_str
 from contextlib import contextmanager
 
 DB_PATH = os.environ.get("AML_AGENT_DB_PATH", "aml_agent.db")
@@ -118,7 +119,7 @@ def generate_case_id():
 
 
 def _now():
-    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    return zim_now_str()
 
 
 def save_case(case_id, officer_id, **fields):
@@ -232,6 +233,23 @@ def list_own_pending_cosign_cases(officer_id):
         d["cosign"] = json.loads(d["cosign_json"]) if d.get("cosign_json") else {}
         results.append(d)
     return results
+
+
+def list_recently_completed_cases(officer_id, limit=5):
+    """
+    An officer's own cases that have just become fully 'completed' -
+    e.g. a co-signer just finished signing off. Without this, once a case
+    a co-sign was pending on disappears from list_own_pending_cosign_cases()
+    (it's no longer pending), the originating officer has no way to
+    navigate back to it unless it happens to still be loaded in their
+    current browser session - this closes that gap."""
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT case_id, risk_summary, updated_at FROM cases "
+            "WHERE officer_id = ? AND status = 'completed' ORDER BY updated_at DESC LIMIT ?",
+            (officer_id, limit),
+        ).fetchall()
+    return [dict(r) for r in rows]
 
 
 def case_belongs_to_officer(case_id, officer_id) -> bool:

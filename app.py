@@ -36,6 +36,7 @@ Run locally with:  streamlit run app.py
 import streamlit as st
 import pandas as pd
 from datetime import datetime
+from tz_utils import zim_now_str
 import uuid
 import tempfile
 import os
@@ -270,6 +271,24 @@ if own_pending_cosign:
                         st.session_state.pop(cancel_key, None)
                         st.rerun()
 
+recently_completed = case_store.list_recently_completed_cases(officer["officer_id"])
+if recently_completed:
+    with st.expander(f"\u2705 Your recently completed case(s) ({len(recently_completed)})"):
+        st.caption("A co-signer has finished signing off on these. Click one to view its final report and generate any reports for it.")
+        for c in recently_completed:
+            rcol1, rcol2 = st.columns([4, 1])
+            with rcol1:
+                st.markdown(f"**{c['case_id']}** \u2014 {c['risk_summary'] or 'completed'} (closed {c['updated_at']})")
+            with rcol2:
+                if st.button("View", key=f"view_completed_{c['case_id']}"):
+                    restored = case_store.load_case(c["case_id"])
+                    st.session_state.case_id = restored["case_id"]
+                    st.session_state.thread_id = restored["thread_id"] or str(uuid.uuid4())
+                    st.session_state.raw_df = pd.DataFrame(restored["transactions"]) if restored["transactions"] else None
+                    st.session_state.final_report = restored["final_report"]
+                    st.session_state.pipeline_status = "complete"
+                    st.rerun()
+
 if officer["role"] in SECOND_SIGNER_ROLES:
     cosign_queue = case_store.list_pending_cosign(officer["officer_id"])
     # Filter each case down to the transactions THIS officer may actually
@@ -389,7 +408,7 @@ if my_cosigned_cases:
                     st.download_button(
                         "\u2B07 Download SAR Filing Report (Word)",
                         data=sar_docx_bytes,
-                        file_name=f"SAR_filing_{mc['case_id']}_{datetime.now().strftime('%Y%m%d_%H%M')}.docx",
+                        file_name=f"SAR_filing_{mc['case_id']}_{zim_now_str('%Y%m%d_%H%M')}.docx",
                         mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
                         key=f"dl_sar_{mc['case_id']}",
                     )
@@ -484,7 +503,7 @@ with st.sidebar:
                     st.session_state.fx_rates[code] = manual_rate
                     st.session_state.fx_sources[code] = {
                         "source": "Manual Override",
-                        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        "timestamp": zim_now_str("%Y-%m-%d %H:%M:%S"),
                     }
                     st.success(f"Manual override recorded for {code}. This does not modify any original transaction data.")
 
@@ -1013,7 +1032,7 @@ if st.session_state.pipeline_status in ("awaiting_review", "complete"):
                 st.success("Saved.")
 
         if st.button("\u2705 CONFIRM & SIGN DECISION", type="primary", disabled=(still_pending > 0)):
-            reviewed_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            reviewed_at = zim_now_str("%Y-%m-%d %H:%M:%S")
             for txn_id, d in decisions.items():
                 d["reviewed_at"] = reviewed_at
                 st.session_state.audit_trail.append({
@@ -1126,7 +1145,7 @@ if st.session_state.pipeline_status in ("awaiting_review", "complete"):
                             st.download_button(
                                 "\u2B07 Download SAR Filing Report (Word, for submission to FIU)",
                                 data=sar_docx_bytes,
-                                file_name=f"SAR_filing_{st.session_state.case_id}_{datetime.now().strftime('%Y%m%d_%H%M')}.docx",
+                                file_name=f"SAR_filing_{st.session_state.case_id}_{zim_now_str('%Y%m%d_%H%M')}.docx",
                                 mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
                             )
 
@@ -1210,7 +1229,7 @@ if st.session_state.pipeline_status in ("awaiting_review", "complete"):
                 st.download_button(
                     "\u2B07 Download audit trail (CSV)",
                     data=audit_df.to_csv(index=False).encode("utf-8"),
-                    file_name=f"aml_audit_trail_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
+                    file_name=f"aml_audit_trail_{zim_now_str('%Y%m%d_%H%M')}.csv",
                     mime="text/csv",
                 )
 
@@ -1230,7 +1249,7 @@ if st.session_state.pipeline_status in ("awaiting_review", "complete"):
                     st.download_button(
                         "\u2B07 Download escalation report (Word)",
                         data=esc_bytes,
-                        file_name=f"escalated_transactions_{st.session_state.case_id or 'report'}_{datetime.now().strftime('%Y%m%d_%H%M')}.docx",
+                        file_name=f"escalated_transactions_{st.session_state.case_id or 'report'}_{zim_now_str('%Y%m%d_%H%M')}.docx",
                         mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
                     )
         with dl2:
@@ -1249,7 +1268,7 @@ if st.session_state.pipeline_status in ("awaiting_review", "complete"):
                 st.download_button(
                     "\u2B07 Download report (Excel)",
                     data=excel_bytes,
-                    file_name=f"aml_compliance_report_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
+                    file_name=f"aml_compliance_report_{zim_now_str('%Y%m%d_%H%M')}.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 )
         with dl3:
@@ -1262,7 +1281,7 @@ if st.session_state.pipeline_status in ("awaiting_review", "complete"):
                 st.download_button(
                     "\u2B07 Download report (PDF)",
                     data=pdf_bytes,
-                    file_name=f"aml_compliance_report_{datetime.now().strftime('%Y%m%d_%H%M')}.pdf",
+                    file_name=f"aml_compliance_report_{zim_now_str('%Y%m%d_%H%M')}.pdf",
                     mime="application/pdf",
                 )
 

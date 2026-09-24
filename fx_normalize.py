@@ -21,7 +21,7 @@ Supported transaction currencies: USD, ZAR, ZWG (ZiG). Designed so
 additional currencies can be added by extending SUPPORTED_CURRENCIES.
 """
 
-from datetime import datetime
+from tz_utils import zim_now_str
 
 SUPPORTED_CURRENCIES = ["USD", "ZAR", "ZWG"]
 CURRENCY_LABELS = {"USD": "US Dollar", "ZAR": "South African Rand", "ZWG": "Zimbabwe Gold (ZiG)"}
@@ -85,10 +85,10 @@ def fetch_live_rate(currency_code: str, timeout=6):
         if usd_to_currency <= 0:
             return None, {"source": "Live (unavailable)", "message": "Live source returned an invalid rate."}
         rate_to_usd = 1.0 / usd_to_currency
-        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        now = zim_now_str()
         return rate_to_usd, {
             "source": "Live",
-            "message": f"Fetched live from open.er-api.com at {now}.",
+            "message": f"Fetched live from open.er-api.com at {now} (Zimbabwe time).",
             "timestamp": now,
         }
     except Exception as e:

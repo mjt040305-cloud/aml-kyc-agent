@@ -17,6 +17,7 @@ This is deliberately different from sar_filing_report.py:
 """
 
 from datetime import datetime
+from tz_utils import zim_now_str
 from docx import Document
 from docx.shared import Pt, RGBColor, Inches
 from docx.enum.text import WD_ALIGN_PARAGRAPH
@@ -64,7 +65,7 @@ def build_escalation_report_docx(final_report: list, case_id: str, output_path: 
     doc.add_paragraph()
     meta = doc.add_paragraph()
     meta.add_run(f"Case Reference: {case_id}").bold = True
-    doc.add_paragraph(f"Prepared: {datetime.now().strftime('%Y-%m-%d %H:%M')}    |    Transactions escalated: {len(escalated)}")
+    doc.add_paragraph(f"Prepared: {zim_now_str('%Y-%m-%d %H:%M')}    |    Transactions escalated: {len(escalated)}")
     doc.add_paragraph()
 
     for txn in escalated:
@@ -77,14 +78,25 @@ def build_escalation_report_docx(final_report: list, case_id: str, output_path: 
 
         table = doc.add_table(rows=0, cols=2)
         table.style = "Light Grid Accent 1"
+        cat_scores = txn.get("category_scores", {})
         fields = [
             ("Customer ID", txn.get("customer_id", "N/A")),
             ("Date", txn.get("date", "N/A")),
+            ("Transaction type", txn.get("transaction_type", "N/A")),
+            ("Customer KYC risk profile", txn.get("customer_risk_profile", "N/A")),
             ("Original amount", f"{oc} {oa:,.2f}"),
+            ("Original currency", oc),
             ("USD equivalent", f"${usd:,.2f}"),
+            ("USD exchange rate applied", f"{txn.get('usd_exchange_rate', 'N/A')}"),
             ("FX rate source", txn.get("fx_rate_source", "N/A")),
+            ("FX rate timestamp", txn.get("fx_rate_timestamp", "N/A")),
             ("Counterparty jurisdiction", txn.get("counterparty_country", "N/A")),
             ("Overall risk score", f"{txn.get('risk_score', 'N/A')} ({txn.get('risk_bucket', 'N/A')})"),
+            ("Customer risk category score", cat_scores.get("Customer", "N/A")),
+            ("Transaction risk category score", cat_scores.get("Transaction", "N/A")),
+            ("Geographic risk category score", cat_scores.get("Geographic", "N/A")),
+            ("Behavioural risk category score", cat_scores.get("Behavioural", "N/A")),
+            ("Case reference", txn.get("case_reference") or case_id),
             ("Reviewed by", txn.get("reviewed_by", "N/A")),
             ("Reviewer notes", txn.get("reviewer_notes") or "(none)"),
         ]
