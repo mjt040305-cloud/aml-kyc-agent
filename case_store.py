@@ -65,6 +65,7 @@ def init_case_db():
                 officer_notes_json TEXT,
                 review_state_json TEXT,
                 cosign_json TEXT,
+                sar_generated_by_json TEXT,
                 workflow_node TEXT,
                 status TEXT NOT NULL DEFAULT 'in_progress',
                 risk_summary TEXT,
@@ -72,14 +73,16 @@ def init_case_db():
                 updated_at TEXT NOT NULL
             )
         """)
-        # Backward-compatible migration: a database created before the
-        # two-person sign-off feature won't have this column yet. SQLite
-        # has no "ADD COLUMN IF NOT EXISTS", so attempt it and ignore the
-        # error if the column is already there.
-        try:
-            conn.execute("ALTER TABLE cases ADD COLUMN cosign_json TEXT")
-        except sqlite3.OperationalError:
-            pass
+        # Backward-compatible migration: a database created before a given
+        # feature won't have its column(s) yet. SQLite has no "ADD COLUMN
+        # IF NOT EXISTS", so attempt each and ignore the error if it's
+        # already there.
+        for migration in ["ALTER TABLE cases ADD COLUMN cosign_json TEXT",
+                           "ALTER TABLE cases ADD COLUMN sar_generated_by_json TEXT"]:
+            try:
+                conn.execute(migration)
+            except sqlite3.OperationalError:
+                pass
         conn.execute("""
             CREATE TABLE IF NOT EXISTS audit_log (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -172,7 +175,7 @@ def load_case(case_id):
     case = dict(row)
     for key in ["transactions_json", "fx_state_json", "rules_config_json", "analysed_json",
                 "pending_json", "final_report_json", "officer_notes_json", "review_state_json",
-                "cosign_json"]:
+                "cosign_json", "sar_generated_by_json"]:
         if case.get(key):
             case[key.replace("_json", "")] = json.loads(case[key])
         else:
@@ -353,14 +356,19 @@ def list_cases_cosigned_by(officer_id):
     signature on at least one transaction - used so a co-signer can
     generate the SAR filing report from their own normal login view,
     without ever needing to have run the pipeline themselves (they
-    typically never do - see app.py's use of this)."""
+    typically never do - see app.py's use of this). Excludes any case
+    this officer has already generated their SAR report for (see
+    mark_sar_generated()), so the option disappears once used."""
     with get_conn() as conn:
         rows = conn.execute(
-            "SELECT case_id, final_report_json, cosign_json, updated_at FROM cases "
+            "SELECT case_id, final_report_json, cosign_json, sar_generated_by_json, updated_at FROM cases "
             "WHERE status = 'completed' ORDER BY updated_at DESC"
         ).fetchall()
     results = []
     for r in rows:
+        already_generated = json.loads(r["sar_generated_by_json"]) if r["sar_generated_by_json"] else []
+        if officer_id in already_generated:
+            continue
         cosign = json.loads(r["cosign_json"]) if r["cosign_json"] else {}
         my_cosigned = {tid: e for tid, e in cosign.items() if e.get("second_officer_id") == officer_id}
         if my_cosigned:
@@ -448,3 +456,78 @@ def record_second_signature(case_id, transaction_id, second_officer_id, second_o
                      previous_status="pending_cosign", new_status="completed",
                      decision="All required co-signatures received")
     return True, "Co-signature recorded." + (" All required signatures received - case is now completed." if all_signed else " Awaiting further co-signature(s) on this case.")
+
+
+def cancel_cosign_request(case_id, transaction_id, officer_id, officer_name, new_status, notes=""):
+    """
+    Lets the ORIGINAL escalating officer withdraw a co-signature request
+    for one transaction before anyone has co-signed it, replacing the
+    escalation with a different decision (e.g. "Approve (false positive)"
+    or "Dismiss - insufficient grounds") instead. Refuses if this officer
+    doesn't own the case, if the transaction was already co-signed (too
+    late to withdraw - the second officer's action is on record), or if
+    the case isn't currently awaiting co-signature at all.
+
+    If this was the last outstanding co-signature requirement on the
+    case, the case is marked 'completed' with the new decision - no
+    co-signature is needed for a non-escalation decision. Otherwise the
+    case stays 'pending_cosign' for its remaining transaction(s).
+
+    Returns (success: bool, message: str).
+    """
+    case = load_case(case_id)
+    if case is None:
+        return False, "Case not found."
+    if case["officer_id"] != officer_id:
+        return False, "You can only cancel a co-signature request on a case you originated."
+    if case["status"] != "pending_cosign":
+        return False, "This case is not currently awaiting a second sign-off."
+
+    cosign = case.get("cosign") or {}
+    entry = cosign.get(transaction_id)
+    if entry is None:
+        return False, "This transaction is not part of the case's co-signature requirements."
+    if entry.get("second_officer_id"):
+        return False, "This transaction has already been co-signed and can no longer be withdrawn."
+
+    del cosign[transaction_id]
+
+    final_report = case.get("final_report") or []
+    for txn in final_report:
+        if txn.get("transaction_id") == transaction_id:
+            txn["review_status"] = new_status
+            txn["reviewer_notes"] = notes
+            txn["reviewed_by"] = officer_name
+
+    remaining_pending = any(not e.get("second_officer_id") for e in cosign.values())
+    new_case_status = "pending_cosign" if remaining_pending else "completed"
+
+    with get_conn() as conn:
+        conn.execute(
+            "UPDATE cases SET cosign_json = ?, final_report_json = ?, status = ?, updated_at = ? WHERE case_id = ?",
+            (json.dumps(cosign), json.dumps(final_report), new_case_status, _now(), case_id),
+        )
+    append_audit(case_id, officer_id, officer_name, "CO-SIGN REQUEST CANCELLED",
+                 previous_status="pending_cosign", new_status=new_case_status,
+                 decision=f"{transaction_id}: withdrawn, changed to '{new_status}'")
+    return True, f"Request withdrawn - {transaction_id} is now recorded as '{new_status}'." + (
+        " The case is now fully completed." if new_case_status == "completed" else " Other transaction(s) in this case are still awaiting co-signature."
+    )
+
+
+def mark_sar_generated(case_id, officer_id):
+    """Records that this officer has generated (and presumably
+    downloaded) their SAR filing report for this case - so
+    list_cases_cosigned_by() stops surfacing it to them afterward. Stored
+    per-officer since different officers can co-sign different
+    transactions within the same case."""
+    case = load_case(case_id)
+    if case is None:
+        return
+    generated_by = set(case.get("sar_generated_by") or [])
+    generated_by.add(officer_id)
+    with get_conn() as conn:
+        conn.execute(
+            "UPDATE cases SET sar_generated_by_json = ?, updated_at = ? WHERE case_id = ?",
+            (json.dumps(sorted(generated_by)), _now(), case_id),
+        )
