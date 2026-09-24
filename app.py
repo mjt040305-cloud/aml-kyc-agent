@@ -972,22 +972,42 @@ if st.session_state.pipeline_status in ("awaiting_review", "complete"):
                     tid: e for tid, e in cosign.items()
                     if e.get("decision") == "Escalate to SAR filing" and e.get("second_officer_id")
                 }
-                if fully_signed:
-                    st.markdown(f"**{len(fully_signed)} transaction(s) fully signed off and ready for SAR filing.**")
-                    if st.button("\U0001F4C4 Generate SAR Filing Report (for FIU)"):
+                # Only the officer who actually provided the SECOND
+                # signature (the co-signer) may generate the filing
+                # package - not the original escalating officer, and not
+                # any other officer who happens to view this report.
+                my_cosigned = {
+                    tid: e for tid, e in fully_signed.items()
+                    if e.get("second_officer_id") == officer["officer_id"]
+                }
+                if fully_signed and not my_cosigned:
+                    st.info(
+                        f"\U0001F4C4 {len(fully_signed)} transaction(s) are fully signed off and ready for SAR "
+                        f"filing. Only the co-signing officer ({', '.join(sorted({e['second_officer_name'] for e in fully_signed.values()}))}) "
+                        f"can generate the filing report."
+                    )
+                elif my_cosigned:
+                    st.markdown(f"**{len(my_cosigned)} transaction(s) you co-signed are ready for SAR filing.**")
+                    if st.button("\U0001F4C4 Generate SAR Filing Report (Word, for FIU)"):
                         with st.spinner("Building SAR filing package..."):
-                            sar_tmp_path = os.path.join(tempfile.gettempdir(), "sar_filing_report.pdf")
-                            result_path, sar_err = sar_filing_report.build_sar_filing_pdf(case_status, sar_tmp_path)
+                            sar_tmp_path = os.path.join(tempfile.gettempdir(), "sar_filing_report.docx")
+                            # Only this officer's own co-signed transactions go into
+                            # the package they generate - a case with transactions
+                            # co-signed by different officers never lets one of them
+                            # produce a filing package for someone else's signature.
+                            case_for_filing = dict(case_status)
+                            case_for_filing["cosign"] = my_cosigned
+                            result_path, sar_err = sar_filing_report.build_sar_filing_docx(case_for_filing, sar_tmp_path)
                         if sar_err:
                             st.error(sar_err)
                         else:
                             with open(result_path, "rb") as f:
-                                sar_pdf_bytes = f.read()
+                                sar_docx_bytes = f.read()
                             st.download_button(
-                                "\u2B07 Download SAR Filing Report (PDF, for submission to FIU)",
-                                data=sar_pdf_bytes,
-                                file_name=f"SAR_filing_{st.session_state.case_id}_{datetime.now().strftime('%Y%m%d_%H%M')}.pdf",
-                                mime="application/pdf",
+                                "\u2B07 Download SAR Filing Report (Word, for submission to FIU)",
+                                data=sar_docx_bytes,
+                                file_name=f"SAR_filing_{st.session_state.case_id}_{datetime.now().strftime('%Y%m%d_%H%M')}.docx",
+                                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
                             )
 
         report_df = pd.DataFrame(st.session_state.final_report)

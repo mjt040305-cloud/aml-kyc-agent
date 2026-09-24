@@ -1,52 +1,36 @@
 """
 sar_filing_report.py
 ---------------------
-Generates the final SAR filing PDF for a fully completed (two-person
-signed-off) case, formatted for submission to the Financial Intelligence
-Unit (FIU) Zimbabwe - the statutory recipient of Suspicious Transaction
-Reports under the Money Laundering and Proceeds of Crime Act.
+Generates the final SAR filing document (Word/.docx) for a fully
+completed (two-person signed-off) case, formatted for submission to the
+Financial Intelligence Unit (FIU) Zimbabwe - the statutory recipient of
+Suspicious Transaction Reports under the Money Laundering and Proceeds of
+Crime Act.
 
 This module only produces output for transactions that have BOTH the
 first officer's decision AND a second officer's co-signature recorded
 (see case_store.py's two-person sign-off workflow). A case still awaiting
 co-signature has no completed filing package to produce - see
-build_sar_filing_pdf()'s early return in that situation.
+build_sar_filing_docx()'s early return in that situation.
+
+Word (.docx) rather than PDF, so the receiving institution/FIU can
+annotate, copy figures from, or merge this into their own filing
+template - this uses python-docx, the Python library for generating
+.docx files programmatically (not to be confused with the separate
+npm "docx" package used for document authoring in other contexts).
 """
 
 from datetime import datetime
-from fpdf import FPDF
+from docx import Document
+from docx.shared import Pt, RGBColor, Inches
+from docx.enum.text import WD_ALIGN_PARAGRAPH
 
 import sar_narrative
 
-NAVY = (31, 56, 100)
+NAVY = RGBColor(0x1F, 0x38, 0x64)
 
 
-def _safe(text) -> str:
-    """fpdf2's default Helvetica font is latin-1 only; strip anything else."""
-    return str(text).encode("latin-1", "ignore").decode("latin-1")
-
-
-class SARFilingPDF(FPDF):
-    def header(self):
-        self.set_font("Helvetica", "B", 14)
-        self.set_text_color(*NAVY)
-        self.set_x(self.l_margin)
-        self.multi_cell(0, 10, "Suspicious Activity Report - Filing Package", align="C")
-        self.set_font("Helvetica", "", 9)
-        self.set_text_color(90, 90, 90)
-        self.set_x(self.l_margin)
-        self.multi_cell(0, 6, "Prepared for submission to the Financial Intelligence Unit (FIU), Zimbabwe", align="C")
-        self.ln(4)
-
-    def footer(self):
-        self.set_y(-15)
-        self.set_x(self.l_margin)
-        self.set_font("Helvetica", "I", 8)
-        self.set_text_color(120, 120, 120)
-        self.multi_cell(0, 10, f"Page {self.page_no()}", align="C")
-
-
-def build_sar_filing_pdf(case: dict, output_path: str):
+def build_sar_filing_docx(case: dict, output_path: str):
     """
     `case`: the dict returned by case_store.load_case() for a case whose
     status is 'completed'.
@@ -66,77 +50,85 @@ def build_sar_filing_pdf(case: dict, output_path: str):
     final_report = case.get("final_report") or []
     txn_by_id = {t["transaction_id"]: t for t in final_report}
 
-    pdf = SARFilingPDF(orientation="L", unit="mm", format="A4")
-    pdf.set_auto_page_break(auto=True, margin=15)
-    pdf.add_page()
+    doc = Document()
+    for section in doc.sections:
+        section.left_margin = Inches(1)
+        section.right_margin = Inches(1)
 
-    pdf.set_font("Helvetica", "B", 11)
-    pdf.set_text_color(0, 0, 0)
-    pdf.set_x(pdf.l_margin)
-    pdf.multi_cell(0, 8, _safe(f"Case Reference: {case['case_id']}"))
-    pdf.set_font("Helvetica", "", 10)
-    pdf.set_x(pdf.l_margin)
-    pdf.multi_cell(0, 6, _safe(
-        f"Prepared: {datetime.now().strftime('%Y-%m-%d %H:%M')}  |  Transactions filed: {len(escalated)}"
-    ))
-    pdf.ln(4)
+    title = doc.add_paragraph()
+    title.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    run = title.add_run("Suspicious Activity Report \u2014 Filing Package")
+    run.bold = True
+    run.font.size = Pt(18)
+    run.font.color.rgb = NAVY
+
+    subtitle = doc.add_paragraph()
+    subtitle.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    srun = subtitle.add_run("Prepared for submission to the Financial Intelligence Unit (FIU), Zimbabwe")
+    srun.italic = True
+    srun.font.size = Pt(10)
+    srun.font.color.rgb = RGBColor(0x60, 0x60, 0x60)
+
+    doc.add_paragraph()
+    meta = doc.add_paragraph()
+    meta.add_run(f"Case Reference: {case['case_id']}").bold = True
+    doc.add_paragraph(f"Prepared: {datetime.now().strftime('%Y-%m-%d %H:%M')}    |    Transactions filed: {len(escalated)}")
+    doc.add_paragraph()
 
     for tid, entry in escalated.items():
         txn = txn_by_id.get(tid, {})
 
-        pdf.set_font("Helvetica", "B", 12)
-        pdf.set_x(pdf.l_margin)
-        pdf.multi_cell(0, 8, _safe(f"Transaction {tid}"))
+        heading = doc.add_heading(level=2)
+        heading.add_run(f"Transaction {tid}").font.color.rgb = NAVY
 
-        pdf.set_font("Helvetica", "", 9)
         oc = txn.get("original_currency", "USD")
         oa = txn.get("original_amount", txn.get("amount", 0)) or 0
         usd = txn.get("usd_equivalent", txn.get("amount", 0)) or 0
+
+        table = doc.add_table(rows=0, cols=2)
+        table.style = "Light Grid Accent 1"
         fields = [
-            f"Customer ID: {txn.get('customer_id', 'N/A')}",
-            f"Date: {txn.get('date', 'N/A')}",
-            f"Original amount: {oc} {oa:,.2f}  |  USD equivalent: ${usd:,.2f}",
-            f"FX rate source: {txn.get('fx_rate_source', 'N/A')}",
-            f"Counterparty jurisdiction: {txn.get('counterparty_country', 'N/A')}",
-            f"Overall risk score: {txn.get('risk_score', 'N/A')} ({txn.get('risk_bucket', 'N/A')})",
+            ("Customer ID", txn.get("customer_id", "N/A")),
+            ("Date", txn.get("date", "N/A")),
+            ("Original amount", f"{oc} {oa:,.2f}"),
+            ("USD equivalent", f"${usd:,.2f}"),
+            ("FX rate source", txn.get("fx_rate_source", "N/A")),
+            ("Counterparty jurisdiction", txn.get("counterparty_country", "N/A")),
+            ("Overall risk score", f"{txn.get('risk_score', 'N/A')} ({txn.get('risk_bucket', 'N/A')})"),
         ]
-        for f in fields:
-            pdf.set_x(pdf.l_margin)
-            pdf.multi_cell(0, 5, _safe(f))
+        for label, value in fields:
+            row = table.add_row()
+            row.cells[0].text = label
+            row.cells[0].paragraphs[0].runs[0].bold = True
+            row.cells[1].text = str(value)
 
         triggered = txn.get("triggered_rules", [])
         if triggered:
-            pdf.set_x(pdf.l_margin)
-            pdf.multi_cell(0, 5, "AML rules triggered:")
+            doc.add_paragraph()
+            doc.add_paragraph("AML rules triggered:").runs[0].bold = True
             for r in triggered:
-                pdf.set_x(pdf.l_margin)
-                pdf.multi_cell(0, 5, _safe(f"  - {r.get('label', '')}: {r.get('reason', '')}"))
+                doc.add_paragraph(f"{r.get('label', '')}: {r.get('reason', '')}", style="List Bullet")
 
-        pdf.ln(2)
-        pdf.set_font("Helvetica", "B", 9)
-        pdf.set_x(pdf.l_margin)
-        pdf.multi_cell(0, 5, "Narrative:")
-        pdf.set_font("Helvetica", "", 9)
+        doc.add_paragraph()
+        doc.add_paragraph("Narrative:").runs[0].bold = True
         narrative, _ = sar_narrative.generate_sar_narrative(txn)
-        pdf.set_x(pdf.l_margin)
-        pdf.multi_cell(0, 5, _safe(narrative))
+        for para_text in (narrative or "").split("\n\n"):
+            if para_text.strip():
+                doc.add_paragraph(para_text.strip())
 
-        pdf.ln(3)
-        pdf.set_font("Helvetica", "B", 9)
-        pdf.set_x(pdf.l_margin)
-        pdf.multi_cell(0, 5, "Sign-off (two-person maker-checker):")
-        pdf.set_font("Helvetica", "", 9)
-        pdf.set_x(pdf.l_margin)
-        pdf.multi_cell(0, 5, _safe(
+        doc.add_paragraph()
+        doc.add_paragraph("Sign-off (two-person maker-checker):").runs[0].bold = True
+        doc.add_paragraph(
             f"First reviewer: {entry.get('first_officer_name', 'N/A')} "
-            f"({entry.get('first_officer_role', 'N/A')}) - {entry.get('first_signed_at', 'N/A')}"
-        ))
-        pdf.set_x(pdf.l_margin)
-        pdf.multi_cell(0, 5, _safe(
+            f"({entry.get('first_officer_role', 'N/A')}) \u2014 {entry.get('first_signed_at', 'N/A')}"
+        )
+        doc.add_paragraph(
             f"Second reviewer (co-sign): {entry.get('second_officer_name', 'N/A')} "
-            f"({entry.get('second_officer_role', 'N/A')}) - {entry.get('second_signed_at', 'N/A')}"
-        ))
-        pdf.ln(6)
+            f"({entry.get('second_officer_role', 'N/A')}) \u2014 {entry.get('second_signed_at', 'N/A')}"
+        )
+        doc.add_paragraph()
+        sep = doc.add_paragraph()
+        sep.paragraph_format.space_after = Pt(12)
 
-    pdf.output(output_path)
+    doc.save(output_path)
     return output_path, None
