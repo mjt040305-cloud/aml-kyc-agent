@@ -348,6 +348,31 @@ def submit_for_cosign(case_id, officer_id, officer_name, officer_role, cosign_re
                  decision=f"{len(cosign_requirements)} transaction(s) require a second signature{routing_note}")
 
 
+def list_cases_cosigned_by(officer_id):
+    """Completed cases where this officer provided the second (co-sign)
+    signature on at least one transaction - used so a co-signer can
+    generate the SAR filing report from their own normal login view,
+    without ever needing to have run the pipeline themselves (they
+    typically never do - see app.py's use of this)."""
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT case_id, final_report_json, cosign_json, updated_at FROM cases "
+            "WHERE status = 'completed' ORDER BY updated_at DESC"
+        ).fetchall()
+    results = []
+    for r in rows:
+        cosign = json.loads(r["cosign_json"]) if r["cosign_json"] else {}
+        my_cosigned = {tid: e for tid, e in cosign.items() if e.get("second_officer_id") == officer_id}
+        if my_cosigned:
+            results.append({
+                "case_id": r["case_id"],
+                "final_report": json.loads(r["final_report_json"]) if r["final_report_json"] else [],
+                "cosign": my_cosigned,
+                "updated_at": r["updated_at"],
+            })
+    return results
+
+
 def list_pending_cosign(exclude_officer_id):
     """Cases awaiting a second officer's co-signature, excluding cases
     originated by exclude_officer_id - an officer can never see their own

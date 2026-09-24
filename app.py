@@ -278,6 +278,40 @@ if officer["role"] in SECOND_SIGNER_ROLES:
                             st.rerun()
         st.divider()
 
+# ---------------------------------------------------------------------------
+# SAR FILING - FOR THE CO-SIGNER, NOT THE ESCALATING OFFICER
+#
+# A co-signer typically never runs the pipeline themselves, so Step 5
+# (gated behind st.session_state.pipeline_status == "complete") would
+# never render for them - they'd have no way to reach the SAR filing
+# button at all. This shows it directly here instead, for every completed
+# case where THIS officer provided the second signature.
+# ---------------------------------------------------------------------------
+my_cosigned_cases = case_store.list_cases_cosigned_by(officer["officer_id"])
+if my_cosigned_cases:
+    with st.expander(f"\U0001F4C4 SAR filing reports ready for you to generate ({len(my_cosigned_cases)})", expanded=True):
+        st.caption("You co-signed these High-risk escalations - only you can generate their SAR filing package.")
+        for mc in my_cosigned_cases:
+            st.markdown(f"**{mc['case_id']}** \u2014 {len(mc['cosign'])} transaction(s) you co-signed (updated {mc['updated_at']})")
+            if st.button("\U0001F4C4 Generate SAR Filing Report (Word, for FIU)", key=f"gen_sar_{mc['case_id']}"):
+                with st.spinner("Building SAR filing package..."):
+                    sar_tmp_path = os.path.join(tempfile.gettempdir(), f"sar_filing_{mc['case_id']}.docx")
+                    case_for_filing = {"case_id": mc["case_id"], "final_report": mc["final_report"], "cosign": mc["cosign"]}
+                    result_path, sar_err = sar_filing_report.build_sar_filing_docx(case_for_filing, sar_tmp_path)
+                if sar_err:
+                    st.error(sar_err)
+                else:
+                    with open(result_path, "rb") as f:
+                        sar_docx_bytes = f.read()
+                    st.download_button(
+                        "\u2B07 Download SAR Filing Report (Word)",
+                        data=sar_docx_bytes,
+                        file_name=f"SAR_filing_{mc['case_id']}_{datetime.now().strftime('%Y%m%d_%H%M')}.docx",
+                        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                        key=f"dl_sar_{mc['case_id']}",
+                    )
+        st.divider()
+
 
 # ---------------------------------------------------------------------------
 with st.sidebar:
