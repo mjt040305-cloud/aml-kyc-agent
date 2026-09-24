@@ -273,7 +273,7 @@ with st.sidebar:
     if "sound_alerts_enabled" not in st.session_state:
         st.session_state.sound_alerts_enabled = True
     st.session_state.sound_alerts_enabled = st.checkbox(
-        "\U0001F50A Play a sound alert when a transaction breaches the structuring threshold",
+        "\U0001F50A Play a sound alert when any transaction triggers an AML rule",
         value=st.session_state.sound_alerts_enabled,
     )
     st.caption("A UX convenience only - every transaction still goes through the full human review checkpoint regardless of this setting.")
@@ -636,18 +636,28 @@ if raw_df is not None:
                 # to trigger st.rerun() below, which would discard any
                 # widget (including st.audio) rendered in THIS pass before
                 # the browser ever sees it. So we only record which
-                # transactions breached the threshold here, and actually
+                # transactions triggered an AML rule here, and actually
                 # render+autoplay the tone on the very next render pass
                 # (see the top of the Step 2-3 section), where it's
                 # consumed and cleared immediately so it never replays on
                 # a later rerun (e.g. typing a review note).
-                breaching = [t for t in result["pending_transactions"] if audio_alert.transaction_breaches_threshold(t)]
+                breaching = [t for t in result["pending_transactions"] if audio_alert.transaction_triggered_any_rule(t)]
                 if breaching and st.session_state.sound_alerts_enabled:
                     st.session_state.pending_sound_alert = [t["transaction_id"] for t in breaching]
             else:
                 st.session_state.pipeline_status = "complete"
                 st.session_state.final_report = result["final_report"]
             st.rerun()
+
+RISK_LEVEL_MAP = {"Low": 1, "Medium": 2, "High": 3}
+
+
+def risk_level_label(bucket: str) -> str:
+    """Numbered risk level alongside the existing text label - Low=1,
+    Medium=2, High=3. 'None' (no risk detected) has no numbered level."""
+    level = RISK_LEVEL_MAP.get(bucket)
+    return f"Level {level} \u2013 {bucket}" if level else bucket
+
 
 # ---------------------------------------------------------------------------
 # STEP 2-3: RISK ANALYSIS SUMMARY + DASHBOARD
@@ -759,13 +769,14 @@ if st.session_state.pipeline_status in ("awaiting_review", "complete"):
     if st.session_state.pending_sound_alert:
         alert_ids = st.session_state.pending_sound_alert
         st.session_state.pending_sound_alert = None  # consume immediately - never replays on a later rerun
-        st.warning(f"\U0001F6A8 {len(alert_ids)} transaction(s) breach the institutional structuring threshold: {', '.join(alert_ids)}")
-        st.audio(audio_alert.generate_alert_tone(), format="audio/wav", autoplay=True)
+        st.warning(f"\U0001F6A8 {len(alert_ids)} transaction(s) triggered an AML rule and require review: {', '.join(alert_ids)}")
+        st.caption("If you don't hear it automatically (some browsers block autoplay), press play below \u2014 it's the same alert.")
+        st.markdown(audio_alert.alert_audio_html(audio_alert.generate_alert_tone()), unsafe_allow_html=True)
 
     m1, m2, m3 = st.columns(3)
     m1.metric("Total transactions", total)
-    m2.metric("\U0001F534 High risk", high)
-    m3.metric("\U0001F7E0 Medium risk", med)
+    m2.metric(f"\U0001F534 {risk_level_label('High')} risk", high)
+    m3.metric(f"\U0001F7E0 {risk_level_label('Medium')} risk", med)
 
     with st.expander("\U0001F4CA Executive dashboard", expanded=True):
         render_dashboard(all_txns)
@@ -791,7 +802,7 @@ if st.session_state.pipeline_status in ("awaiting_review", "complete"):
                 st.markdown(
                     f"{badge} **{txn['transaction_id']}** \u2014 Customer `{txn['customer_id']}` \u2014 "
                     f"{oc} {oa:,.2f} (USD equivalent: ${txn['amount']:,.2f}) "
-                    f"\u2014 {txn['date']} \u2014 **Overall risk score: {txn['risk_score']}**"
+                    f"\u2014 {txn['date']} \u2014 **Overall risk score: {txn['risk_score']} ({risk_level_label(txn['risk_bucket'])})**"
                 )
                 render_call_for_action_banner(txn)
                 render_risk_breakdown(txn)
@@ -984,10 +995,13 @@ if st.session_state.pipeline_status in ("awaiting_review", "complete"):
                 if col not in report_df.columns:
                     report_df[col] = default
 
+        if "risk_bucket" in report_df.columns:
+            report_df["risk_level"] = report_df["risk_bucket"].map(RISK_LEVEL_MAP)
+
         display_cols = [
             "transaction_id", "customer_id", "original_currency", "original_amount",
             "amount", "usd_exchange_rate", "fx_rate_source", "date",
-            "risk_bucket", "risk_score", "case_reference", "flag_reasons",
+            "risk_level", "risk_bucket", "risk_score", "case_reference", "flag_reasons",
             "review_status", "reviewed_by", "reviewer_notes",
         ]
         # Final safety net: even after the fillna pass above, only ever

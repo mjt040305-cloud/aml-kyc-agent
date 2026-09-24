@@ -17,6 +17,7 @@ import io
 import math
 import struct
 import wave
+import base64
 
 
 def generate_alert_tone(duration: float = 0.6, freq: int = 880, sample_rate: int = 44100) -> bytes:
@@ -49,15 +50,49 @@ def generate_alert_tone(duration: float = 0.6, freq: int = 880, sample_rate: int
     return buffer.getvalue()
 
 
-def transaction_breaches_threshold(txn: dict) -> bool:
+def alert_audio_html(wav_bytes: bytes) -> str:
     """
-    True if this transaction's own triggered_rules include the
-    institutional structuring/threshold rule - i.e. its USD-equivalent
-    amount is at or above the institution's configured structuring alert
-    threshold. Kept as its own function so app.py and any future caller
-    checks this the same way everywhere.
+    Returns a self-contained HTML5 <audio> tag for the alert tone, with
+    BOTH autoplay attempted AND visible native controls shown.
+
+    Some browsers silently block autoplay-with-sound even after a genuine
+    user gesture (e.g. clicking "Run compliance analysis"), with no error
+    surfaced anywhere - st.audio(..., autoplay=True) can fail exactly
+    this way with no visible sign why. Showing native controls alongside
+    the autoplay attempt means the officer always has a guaranteed,
+    one-click way to hear the alert even when autoplay itself is blocked,
+    rather than a silent alert that may or may not have actually played.
     """
-    return any(
-        r.get("label") == "Large / structured transaction"
-        for r in txn.get("triggered_rules", [])
-    )
+    b64 = base64.b64encode(wav_bytes).decode("ascii")
+    return f"""
+    <audio autoplay controls style="width: 100%; height: 32px;">
+        <source src="data:audio/wav;base64,{b64}" type="audio/wav">
+    </audio>
+    """
+
+
+def transaction_triggered_any_rule(txn: dict) -> bool:
+    """
+    True if this transaction triggered ANY AML rule at all (Customer,
+    Transaction, Geographic, or Behavioural) - i.e. it was flagged for
+    review, regardless of which specific rule or how severe. This is the
+    broad "something in this batch needs a look" alert; see
+    transaction_breaches_threshold() for the narrower, threshold-specific
+    check if that's what's wanted instead.
+    """
+    return bool(txn.get("triggered_rules"))
+
+
+def transaction_breaches_threshold(txn: dict, threshold: float) -> bool:
+    """
+    True if this transaction's USD-equivalent amount is at or above the
+    institution's configured structuring alert threshold. Compares the
+    amount directly against the threshold rather than matching an exact
+    rule-label string, so this stays correct even if the rules engine's
+    wording for that rule ever changes.
+    """
+    amount = txn.get("amount", txn.get("usd_equivalent", 0))
+    try:
+        return float(amount) >= float(threshold)
+    except (TypeError, ValueError):
+        return False
