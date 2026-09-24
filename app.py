@@ -52,6 +52,7 @@ import auth_db
 import case_store
 import sar_narrative
 import sar_filing_report
+import escalation_report
 import audio_alert
 
 st.set_page_config(page_title="AML/KYC Compliance Agent", page_icon="\U0001F6E1\uFE0F", layout="wide")
@@ -1096,14 +1097,23 @@ if st.session_state.pipeline_status in ("awaiting_review", "complete"):
 
         dl1, dl2, dl3 = st.columns(3)
         with dl1:
-            csv_out = report_df[display_cols + ["category_scores"]].rename(columns={"amount": "usd_equivalent"}).to_csv(index=False).encode("utf-8")
-            st.download_button(
-                "\u2B07 Download report (CSV)",
-                data=csv_out,
-                file_name=f"aml_compliance_report_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
-                mime="text/csv",
-                type="primary"
-            )
+            if st.button("\U0001F4C4 Generate escalation report (Word)", type="primary"):
+                with st.spinner("Building escalation report..."):
+                    esc_tmp_path = os.path.join(tempfile.gettempdir(), "escalation_report.docx")
+                    esc_path, esc_err = escalation_report.build_escalation_report_docx(
+                        st.session_state.final_report, st.session_state.case_id or "N/A", esc_tmp_path
+                    )
+                if esc_err:
+                    st.warning(esc_err)
+                else:
+                    with open(esc_path, "rb") as f:
+                        esc_bytes = f.read()
+                    st.download_button(
+                        "\u2B07 Download escalation report (Word)",
+                        data=esc_bytes,
+                        file_name=f"escalated_transactions_{st.session_state.case_id or 'report'}_{datetime.now().strftime('%Y%m%d_%H%M')}.docx",
+                        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                    )
         with dl2:
             if st.button("\U0001F4CA Generate Excel report"):
                 with st.spinner("Building Excel workbook..."):
