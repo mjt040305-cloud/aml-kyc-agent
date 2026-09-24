@@ -96,6 +96,14 @@ def init_case_db():
                 timestamp TEXT NOT NULL
             )
         """)
+        # Every co-signature query filters by (status, officer_id) - without
+        # an index SQLite has to scan every row in the table on every single
+        # page render for every officer. This is the real, measurable lever
+        # for keeping the co-sign queue fast as case volume grows (the
+        # queries themselves already run the instant a decision is saved -
+        # there is no artificial delay in the write path).
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_cases_status_officer ON cases(status, officer_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_audit_case_id ON audit_log(case_id)")
 
 
 def generate_case_id():
@@ -388,10 +396,15 @@ def list_pending_cosign(exclude_officer_id):
     (also re-enforced inside record_second_signature as a hard check).
     Returns EVERY pending case regardless of routing - app.py filters each
     case's individual transaction entries by assigned_officer_id (None =
-    open to anyone eligible, or a specific officer_id = directed)."""
+    open to anyone eligible, or a specific officer_id = directed).
+
+    Includes final_report and review_state so the co-signer can see full
+    transaction detail (amount, jurisdiction, triggered rules, the first
+    officer's notes) without a second query."""
     with get_conn() as conn:
         rows = conn.execute(
-            "SELECT case_id, officer_id, risk_summary, cosign_json, updated_at FROM cases "
+            "SELECT case_id, officer_id, risk_summary, cosign_json, final_report_json, "
+            "review_state_json, updated_at FROM cases "
             "WHERE status = 'pending_cosign' AND officer_id != ? ORDER BY updated_at ASC",
             (exclude_officer_id,),
         ).fetchall()
@@ -399,6 +412,8 @@ def list_pending_cosign(exclude_officer_id):
     for r in rows:
         d = dict(r)
         d["cosign"] = json.loads(d["cosign_json"]) if d.get("cosign_json") else {}
+        d["final_report"] = json.loads(d["final_report_json"]) if d.get("final_report_json") else []
+        d["review_state"] = json.loads(d["review_state_json"]) if d.get("review_state_json") else {}
         results.append(d)
     return results
 
@@ -456,6 +471,73 @@ def record_second_signature(case_id, transaction_id, second_officer_id, second_o
                      previous_status="pending_cosign", new_status="completed",
                      decision="All required co-signatures received")
     return True, "Co-signature recorded." + (" All required signatures received - case is now completed." if all_signed else " Awaiting further co-signature(s) on this case.")
+
+
+def override_cosign_decision(case_id, transaction_id, officer_id, officer_name, officer_role, new_status, notes=""):
+    """
+    Lets the SECOND officer disagree with the first officer's escalation
+    and record a DIFFERENT final judgement instead of simply co-signing
+    (e.g. they review the evidence and conclude it should be "Approve
+    (false positive)" or "Dismiss - insufficient grounds" rather than
+    filed as a SAR). This still counts as the second officer's review -
+    it's recorded as a completed two-person decision, just a dissenting
+    one, distinct in the audit trail from a straightforward co-sign.
+
+    Refuses under the same conditions as record_second_signature (already
+    co-signed, wrong case status, self-approval) - self-approval here
+    means the officer who escalated it cannot also be the one overriding
+    it, same principle as co-signing.
+
+    Returns (success: bool, message: str).
+    """
+    case = load_case(case_id)
+    if case is None:
+        return False, "Case not found."
+    if case["status"] != "pending_cosign":
+        return False, "This case is not currently awaiting a second sign-off."
+
+    cosign = case.get("cosign") or {}
+    entry = cosign.get(transaction_id)
+    if entry is None:
+        return False, "This transaction is not part of the case's co-signature requirements."
+    if entry["first_officer_id"] == officer_id:
+        return False, "The officer who escalated this transaction cannot also be the one reviewing it."
+    if entry.get("second_officer_id"):
+        return False, "This transaction has already been signed off and can no longer be changed."
+    if entry.get("assigned_officer_id") and entry["assigned_officer_id"] != officer_id:
+        return False, "This request was routed to a specific officer and cannot be actioned by anyone else."
+
+    original_decision = entry.get("decision", "Escalate to SAR filing")
+    entry["second_officer_id"] = officer_id
+    entry["second_officer_name"] = officer_name
+    entry["second_officer_role"] = officer_role
+    entry["second_signed_at"] = _now()
+    entry["decision"] = new_status  # updated - sar_filing_report.py only includes entries still marked "Escalate to SAR filing"
+    entry["overridden_from"] = original_decision
+    cosign[transaction_id] = entry
+
+    final_report = case.get("final_report") or []
+    for txn in final_report:
+        if txn.get("transaction_id") == transaction_id:
+            txn["review_status"] = new_status
+            txn["reviewer_notes"] = (txn.get("reviewer_notes") or "") + \
+                f" [Second-officer override by {officer_name}: {notes}]" if notes else \
+                (txn.get("reviewer_notes") or "") + f" [Second-officer override by {officer_name}]"
+
+    all_signed = all(e.get("second_officer_id") for e in cosign.values())
+    new_case_status = "completed" if all_signed else "pending_cosign"
+
+    with get_conn() as conn:
+        conn.execute(
+            "UPDATE cases SET cosign_json = ?, final_report_json = ?, status = ?, updated_at = ? WHERE case_id = ?",
+            (json.dumps(cosign), json.dumps(final_report), new_case_status, _now(), case_id),
+        )
+    append_audit(case_id, officer_id, officer_name, "SECOND OFFICER OVERRODE DECISION",
+                 previous_status="pending_cosign", new_status=new_case_status,
+                 decision=f"{transaction_id}: '{original_decision}' overridden to '{new_status}'" + (f" - {notes}" if notes else ""))
+    return True, f"Override recorded - {transaction_id} is now '{new_status}'." + (
+        " Case is now fully completed." if all_signed else " Other transaction(s) in this case are still awaiting review."
+    )
 
 
 def cancel_cosign_request(case_id, transaction_id, officer_id, officer_name, new_status, notes=""):

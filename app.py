@@ -288,24 +288,76 @@ if officer["role"] in SECOND_SIGNER_ROLES:
 
     if visible_queue:
         st.warning(f"\U0001F58A\uFE0F **{len(visible_queue)} CASE(S) AWAITING YOUR SECOND SIGN-OFF**")
+        st.caption("This list reflects the database the instant a decision is submitted \u2014 reload this page to see the very latest.")
         for c, actionable in visible_queue:
+            txn_by_id = {t["transaction_id"]: t for t in c.get("final_report", [])}
+            review_state = c.get("review_state") or {}
             with st.container(border=True):
                 st.markdown(f"**Case ID:** {c['case_id']}  \n**Last activity:** {c['updated_at']}")
                 for tid, entry in actionable.items():
-                    routed_note = f" \u2014 routed specifically to you" if entry.get("assigned_officer_id") else " \u2014 open request"
+                    txn = txn_by_id.get(tid, {})
+                    routed_note = " \u2014 routed specifically to you" if entry.get("assigned_officer_id") else " \u2014 open request"
+                    oc = txn.get("original_currency", "USD")
+                    oa = txn.get("original_amount", entry.get("amount_usd", 0))
                     st.markdown(
-                        f"- **{tid}**{routed_note} \u2014 {entry.get('decision', 'Escalate to SAR filing')}, "
-                        f"risk: {entry.get('risk_bucket', 'High')}, "
-                        f"USD equivalent: ${entry.get('amount_usd', 0):,.2f}  \n"
-                        f"  First signed by **{entry['first_officer_name']}** ({entry.get('first_officer_role', '')}) at {entry['first_signed_at']}"
+                        f"##### {tid}{routed_note}\n"
+                        f"**Original amount:** {oc} {oa:,.2f}  \u2014  **USD equivalent:** ${entry.get('amount_usd', 0):,.2f}  \n"
+                        f"**Counterparty jurisdiction:** {txn.get('counterparty_country', 'N/A')}  \n"
+                        f"**Customer:** {txn.get('customer_id', 'N/A')}  \u2014  **Overall risk score:** {txn.get('risk_score', 'N/A')} ({entry.get('risk_bucket', 'High')})"
                     )
-                    if st.button(f"\u2705 CO-SIGN & FINALIZE {tid}", key=f"cosign_{c['case_id']}_{tid}"):
-                        ok, msg = case_store.record_second_signature(
-                            c["case_id"], tid, officer["officer_id"], officer["full_name"], officer["role"]
-                        )
-                        (st.success if ok else st.error)(msg)
-                        if ok:
+                    triggered = txn.get("triggered_rules", [])
+                    if triggered:
+                        st.markdown("**AML rules triggered:**")
+                        for r in triggered:
+                            st.caption(f"\u2022 {r.get('label', '')}: {r.get('reason', '')}")
+                    first_notes = review_state.get(tid, {}).get("notes", "")
+                    st.markdown(
+                        f"**First officer's judgement:** {entry.get('decision', 'Escalate to SAR filing')} \u2014 "
+                        f"by **{entry['first_officer_name']}** ({entry.get('first_officer_role', '')}) at {entry['first_signed_at']}"
+                    )
+                    if first_notes:
+                        st.caption(f"Their notes: {first_notes}")
+
+                    action_col1, action_col2 = st.columns(2)
+                    with action_col1:
+                        if st.button(f"\u2705 Agree & CO-SIGN", key=f"cosign_{c['case_id']}_{tid}"):
+                            ok, msg = case_store.record_second_signature(
+                                c["case_id"], tid, officer["officer_id"], officer["full_name"], officer["role"]
+                            )
+                            (st.success if ok else st.error)(msg)
+                            if ok:
+                                st.rerun()
+                    with action_col2:
+                        override_key = f"show_override_{c['case_id']}_{tid}"
+                        if st.button("\U0001F500 Disagree - give different judgement", key=f"overridebtn_{c['case_id']}_{tid}"):
+                            st.session_state[override_key] = True
                             st.rerun()
+                    if st.session_state.get(override_key):
+                        with st.form(key=f"overrideform_{c['case_id']}_{tid}"):
+                            st.caption(f"Record your own judgement for {tid} instead of co-signing the escalation:")
+                            override_status = st.selectbox(
+                                "Your judgement", ["Approve (false positive)", "Dismiss - insufficient grounds"],
+                                key=f"overridestatus_{c['case_id']}_{tid}",
+                            )
+                            override_notes = st.text_area("Reasoning (recorded in the audit trail)", key=f"overridenotes_{c['case_id']}_{tid}")
+                            oconfirm_col, oback_col = st.columns(2)
+                            with oconfirm_col:
+                                oconfirmed = st.form_submit_button("\u2705 Confirm my judgement")
+                            with oback_col:
+                                oback = st.form_submit_button("Back")
+                        if oconfirmed:
+                            ok, msg = case_store.override_cosign_decision(
+                                c["case_id"], tid, officer["officer_id"], officer["full_name"], officer["role"],
+                                override_status, override_notes,
+                            )
+                            st.session_state.pop(override_key, None)
+                            (st.success if ok else st.error)(msg)
+                            if ok:
+                                st.rerun()
+                        if oback:
+                            st.session_state.pop(override_key, None)
+                            st.rerun()
+                    st.divider()
         st.divider()
 
 # ---------------------------------------------------------------------------
