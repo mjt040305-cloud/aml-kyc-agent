@@ -41,6 +41,14 @@ from rules_engine import analyse_transactions
 from fx_normalize import normalize_transactions, MissingFXRateError
 
 
+def _langgraph_version() -> str:
+    try:
+        import langgraph
+        return getattr(langgraph, "__version__", "unknown")
+    except Exception:
+        return "unknown"
+
+
 class AgentState(TypedDict):
     transactions: List[Dict[str, Any]]   # raw input rows (original currency/amount)
     fx_rates: Dict[str, float]           # currency_code -> rate_to_usd, from app.py's FX panel
@@ -73,8 +81,32 @@ def node_analyse(state: AgentState) -> AgentState:
     analysed_df = analyse_transactions(df, state.get("rules_config"))
     # dates are Timestamps after analyse_transactions - make JSON/state safe
     analysed_df["date"] = analysed_df["date"].astype(str)
-    state["analysed"] = analysed_df.to_dict("records")
+    records = analysed_df.to_dict("records")
+    # Defensive: coerce any leftover numpy scalar types (int64, float64,
+    # bool_) to native Python types. These can pass through pandas'
+    # to_dict("records") looking fine, but have been observed to survive
+    # LangGraph's checkpointer serialization round-trip in a form that
+    # breaks downstream dict access - converting them here, at the source,
+    # is cheap insurance against that entire class of bug.
+    state["analysed"] = [_coerce_record(r) for r in records]
     return state
+
+
+def _coerce_record(record: dict) -> dict:
+    """Recursively convert numpy scalar types to native Python types
+    within one transaction record, leaving everything else untouched."""
+    import numpy as np
+
+    def _coerce_value(v):
+        if isinstance(v, np.generic):
+            return v.item()
+        if isinstance(v, dict):
+            return {k: _coerce_value(vv) for k, vv in v.items()}
+        if isinstance(v, (list, tuple)):
+            return [_coerce_value(vv) for vv in v]
+        return v
+
+    return {k: _coerce_value(v) for k, v in record.items()}
 
 
 def node_human_review(state: AgentState) -> AgentState:
@@ -172,7 +204,22 @@ def run_pipeline(compiled_graph, transactions: List[Dict[str, Any]], thread_id: 
 
     if "__interrupt__" in result:
         payload = result["__interrupt__"][0].value
-        return {"status": "awaiting_review", "pending_transactions": payload["pending_transactions"]}
+        pending = payload["pending_transactions"]
+        # Defensive validation at the source: if this is ever anything
+        # other than a list of transaction dicts (e.g. due to a
+        # LangGraph/checkpointer serialization quirk across versions),
+        # fail loudly and specifically HERE with a clear message, rather
+        # than passing malformed data downstream where it would surface
+        # as a confusing, hard-to-trace TypeError in the UI layer.
+        if not isinstance(pending, list) or any(not isinstance(t, dict) for t in pending):
+            bad_types = sorted({type(t).__name__ for t in pending}) if isinstance(pending, list) else [type(pending).__name__]
+            raise TypeError(
+                f"node_human_review's interrupt payload should be a list of transaction dicts, "
+                f"got: {bad_types}. This points to a LangGraph/checkpointer version compatibility "
+                f"issue (installed: {_langgraph_version()}) rather than a data problem - "
+                f"pin langgraph to a known-compatible version in requirements.txt."
+            )
+        return {"status": "awaiting_review", "pending_transactions": pending}
 
     return {"status": "complete", "final_report": result["final_report"]}
 

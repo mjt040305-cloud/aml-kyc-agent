@@ -917,6 +917,13 @@ if st.session_state.pipeline_status in ("awaiting_review", "complete"):
         if st.session_state.pipeline_status == "awaiting_review"
         else st.session_state.final_report
     )
+    if not all_txns:
+        st.error(
+            "\u26A0\uFE0F This case has no transaction data available to display \u2014 it may have been "
+            "completed before final report data was being saved. Try re-running the analysis, or if "
+            "this is an older case, its report cannot be recovered."
+        )
+        st.stop()
     total = len(st.session_state.raw_df) if st.session_state.raw_df is not None else len(all_txns)
     # Defensive: all_txns should always be a list of transaction dicts, but
     # never let a malformed entry (e.g. from an unexpected upstream shape)
@@ -1055,6 +1062,18 @@ if st.session_state.pipeline_status in ("awaiting_review", "complete"):
                 result = resume_pipeline(graph, decisions, st.session_state.thread_id)
             st.session_state.pipeline_status = "complete"
             st.session_state.final_report = result["final_report"]
+
+            # CRITICAL: persist the final report NOW, before any branch
+            # below locks the case (mark_case_completed / submit_for_cosign
+            # both eventually set status away from 'in_progress', after
+            # which save_case() refuses further writes). Without this, the
+            # database's final_report_json stays None forever for this
+            # case - which is exactly what caused every "NoneType is not
+            # iterable" / "KeyError: transaction_id" crash whenever this
+            # case was later reloaded (e.g. via "recently completed" or a
+            # co-signer's session) - the case's OWN session had the data
+            # in memory, but nothing else ever would.
+            case_store.save_case(st.session_state.case_id, officer["officer_id"], final_report_json=result["final_report"])
 
             # Two-person sign-off (maker-checker): a High-risk transaction
             # escalated to SAR filing does NOT complete the case on this
