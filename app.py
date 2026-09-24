@@ -193,6 +193,25 @@ if st.session_state.case_id is None:
                             st.session_state[f"notes_{tid}"] = d.get("notes", "")
                         st.success(f"Case {c['case_id']} restored \u2014 {sum(1 for d in prior_review_state.values() if d.get('status') != 'Pending')} prior decision(s) recovered.")
                         st.rerun()
+
+                confirm_key = f"confirm_delete_{c['case_id']}"
+                if not st.session_state.get(confirm_key):
+                    if st.button("\U0001F5D1\uFE0F Delete this case", key=f"delete_{c['case_id']}"):
+                        st.session_state[confirm_key] = True
+                        st.rerun()
+                else:
+                    st.error(f"Permanently delete case {c['case_id']}? This cannot be undone \u2014 all saved progress and notes will be lost (the fact that it existed and was deleted stays in the audit log).")
+                    dcol1, dcol2 = st.columns(2)
+                    with dcol1:
+                        if st.button("\u2705 Yes, delete permanently", key=f"confirm_yes_{c['case_id']}"):
+                            ok, msg = case_store.delete_case(c["case_id"], officer["officer_id"], officer["full_name"])
+                            st.session_state.pop(confirm_key, None)
+                            (st.success if ok else st.error)(msg)
+                            st.rerun()
+                    with dcol2:
+                        if st.button("Cancel", key=f"confirm_no_{c['case_id']}"):
+                            st.session_state.pop(confirm_key, None)
+                            st.rerun()
         st.caption("Or start a new case below \u2014 your unfinished investigation(s) above remain saved.")
         st.divider()
 
@@ -770,7 +789,6 @@ if st.session_state.pipeline_status in ("awaiting_review", "complete"):
         alert_ids = st.session_state.pending_sound_alert
         st.session_state.pending_sound_alert = None  # consume immediately - never replays on a later rerun
         st.warning(f"\U0001F6A8 {len(alert_ids)} transaction(s) triggered an AML rule and require review: {', '.join(alert_ids)}")
-        st.caption("If you don't hear it automatically (some browsers block autoplay), press play below \u2014 it's the same alert.")
         st.markdown(audio_alert.alert_audio_html(audio_alert.generate_alert_tone()), unsafe_allow_html=True)
 
     m1, m2, m3 = st.columns(3)

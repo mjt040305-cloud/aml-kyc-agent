@@ -231,6 +231,39 @@ def case_belongs_to_officer(case_id, officer_id) -> bool:
     return row is not None and row["officer_id"] == officer_id
 
 
+def delete_case(case_id, officer_id, officer_name):
+    """
+    Permanently deletes an unfinished case the officer no longer wants to
+    continue with. Returns (success: bool, message: str).
+
+    Restricted on purpose:
+    - Only the case's own officer can delete it (re-checked here even
+      though app.py should already gate on this).
+    - Only a case still in plain 'in_progress' status can be deleted - a
+      case already escalated to a second officer ('pending_cosign') or
+      already 'completed' cannot be silently removed, since someone else
+      may be relying on it or it represents a signed compliance decision.
+
+    An audit_log entry recording the deletion is written BEFORE the case
+    row is removed, and audit_log rows are never deleted alongside it -
+    so even after deletion, the fact that this case existed and was
+    deliberately deleted by this officer remains traceable.
+    """
+    case = load_case(case_id)
+    if case is None:
+        return False, "Case not found."
+    if case["officer_id"] != officer_id:
+        return False, "You can only delete your own cases."
+    if case["status"] != "in_progress":
+        return False, f"Cases with status '{case['status']}' cannot be deleted - only cases still in progress."
+
+    append_audit(case_id, officer_id, officer_name, "CASE DELETED BY OFFICER",
+                 previous_status="in_progress", new_status="deleted", decision=None)
+    with get_conn() as conn:
+        conn.execute("DELETE FROM cases WHERE case_id = ? AND officer_id = ?", (case_id, officer_id))
+    return True, "Case deleted."
+
+
 def mark_case_completed(case_id, officer_id, officer_name, decision_summary):
     """Finalizes a case. After this call, save_case() will refuse further
     modification of this case's fields - see save_case()'s docstring."""

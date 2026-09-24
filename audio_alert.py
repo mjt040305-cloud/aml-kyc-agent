@@ -20,26 +20,29 @@ import wave
 import base64
 
 
-def generate_alert_tone(duration: float = 0.6, freq: int = 880, sample_rate: int = 44100) -> bytes:
+def generate_alert_tone(duration: float = 5.0, beep_freq: int = 880, sample_rate: int = 44100) -> bytes:
     """
-    Returns WAV file bytes for a short, clear two-tone alert beep
-    (a common "attention" pattern: high-low-high) suitable for
-    st.audio(..., autoplay=True).
+    Returns WAV file bytes for a repeating alert beep pattern lasting the
+    full `duration` (default 5 seconds) - a short beep followed by a
+    short silence, repeated, so a 5-second alert reads as an actual
+    attention signal rather than one long continuous tone.
     """
+    beep_len = 0.35
+    gap_len = 0.35
+    cycle_len = beep_len + gap_len
+    n_cycles = max(1, round(duration / cycle_len))
+
     frames = []
-    n_samples = int(sample_rate * duration)
-    for i in range(n_samples):
-        t = i / sample_rate
-        # Two-tone alternating pattern (like a simple alarm chirp) rather
-        # than one flat tone, so it reads as an "alert" rather than a
-        # generic notification ping.
-        segment = int(t / (duration / 3))  # 3 segments: high, low, high
-        this_freq = freq if segment != 1 else freq * 0.75
-        amplitude = 0.5 * math.sin(2 * math.pi * this_freq * t)
-        # Fade in/out slightly at the very start/end to avoid a harsh click
-        fade = min(1.0, i / 200, (n_samples - i) / 200)
-        sample = int(amplitude * fade * 32767)
-        frames.append(struct.pack("<h", sample))
+    for _ in range(n_cycles):
+        beep_samples = int(sample_rate * beep_len)
+        for i in range(beep_samples):
+            t = i / sample_rate
+            amplitude = 0.5 * math.sin(2 * math.pi * beep_freq * t)
+            fade = min(1.0, i / 150, (beep_samples - i) / 150)
+            sample = int(amplitude * fade * 32767)
+            frames.append(struct.pack("<h", sample))
+        gap_samples = int(sample_rate * gap_len)
+        frames.append(struct.pack("<h", 0) * gap_samples)
 
     buffer = io.BytesIO()
     with wave.open(buffer, "wb") as wav_file:
@@ -52,20 +55,18 @@ def generate_alert_tone(duration: float = 0.6, freq: int = 880, sample_rate: int
 
 def alert_audio_html(wav_bytes: bytes) -> str:
     """
-    Returns a self-contained HTML5 <audio> tag for the alert tone, with
-    BOTH autoplay attempted AND visible native controls shown.
-
-    Some browsers silently block autoplay-with-sound even after a genuine
-    user gesture (e.g. clicking "Run compliance analysis"), with no error
-    surfaced anywhere - st.audio(..., autoplay=True) can fail exactly
-    this way with no visible sign why. Showing native controls alongside
-    the autoplay attempt means the officer always has a guaranteed,
-    one-click way to hear the alert even when autoplay itself is blocked,
-    rather than a silent alert that may or may not have actually played.
+    Returns a self-contained, INVISIBLE HTML5 <audio> tag that autoplays
+    the alert tone - no play/pause controls shown, so it plays
+    automatically on the page right after "Run compliance analysis" and
+    nothing else. If the browser blocks autoplay entirely, nothing
+    audible happens (no visible fallback control by design, per the
+    officer's request) - the on-screen warning banner text is still
+    always shown regardless, so the alert is never silent AND invisible
+    at the same time.
     """
     b64 = base64.b64encode(wav_bytes).decode("ascii")
     return f"""
-    <audio autoplay controls style="width: 100%; height: 32px;">
+    <audio autoplay style="display:none;">
         <source src="data:audio/wav;base64,{b64}" type="audio/wav">
     </audio>
     """
