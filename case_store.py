@@ -320,16 +320,26 @@ def submit_for_cosign(case_id, officer_id, officer_name, officer_role, cosign_re
     who made each decision without a later lookup.
     """
     now = _now()
-    stamped = {
-        tid: {
+    stamped = {}
+    for tid, details in cosign_requirements.items():
+        details = dict(details)
+        # Defense in depth: even though app.py's routing dropdown already
+        # excludes the current officer from the list of selectable
+        # co-signers, never trust that alone - if assigned_officer_id
+        # somehow equals the escalating officer's own id (stale session
+        # state, a future UI bug, anything), strip it back to "open"
+        # rather than silently creating a self-approval request no one
+        # else would ever see as theirs to act on.
+        if details.get("assigned_officer_id") == officer_id:
+            details["assigned_officer_id"] = None
+            details["assigned_officer_name"] = None
+        stamped[tid] = {
             **details,
             "first_officer_id": officer_id, "first_officer_name": officer_name,
             "first_officer_role": officer_role, "first_signed_at": now,
             "second_officer_id": None, "second_officer_name": None,
             "second_officer_role": None, "second_signed_at": None,
         }
-        for tid, details in cosign_requirements.items()
-    }
     save_case(case_id, officer_id, cosign_json=stamped, workflow_node="pending_cosign", status="pending_cosign")
     assigned_names = [d.get("assigned_officer_name") for d in cosign_requirements.values() if d.get("assigned_officer_name")]
     routing_note = f" (routed to {', '.join(assigned_names)})" if assigned_names else " (open to any qualifying officer)"
