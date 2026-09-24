@@ -119,3 +119,25 @@ def get_officer(officer_id: str):
     officer.pop("password_hash", None)
     officer.pop("salt", None)
     return officer
+
+
+def list_officers_by_roles(roles):
+    """
+    Returns public records (no password fields) for every officer whose
+    role is in `roles` - used to populate a "route to" dropdown when an
+    officer escalates a High-risk transaction and wants to direct the
+    co-signature request to a specific senior colleague, rather than
+    leaving it open to anyone with a qualifying role.
+    """
+    placeholders = ", ".join("?" for _ in roles)
+    with get_conn() as conn:
+        rows = conn.execute(
+            f"SELECT * FROM officers WHERE role IN ({placeholders}) ORDER BY full_name ASC", tuple(roles)
+        ).fetchall()
+    results = []
+    for row in rows:
+        officer = dict(row)
+        officer.pop("password_hash", None)
+        officer.pop("salt", None)
+        results.append(officer)
+    return results

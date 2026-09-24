@@ -259,59 +259,6 @@ def get_audit_trail(case_id):
         ).fetchall()
     return [dict(r) for r in rows]
 
-# ---------------------------------------------------------------------------
-# SECURITY ALERTS - persistent threshold-breach monitoring
-# ---------------------------------------------------------------------------
-
-def record_security_alert(case_id, officer_id, transaction_id, customer_id, amount_usd, threshold_usd, alert_type="Threshold exceeded"):
-    """Persist a threshold alert once per case/transaction."""
-    with get_conn() as conn:
-        existing = conn.execute(
-            "SELECT id FROM security_alerts WHERE case_id = ? AND transaction_id = ? AND alert_type = ?",
-            (case_id, transaction_id, alert_type),
-        ).fetchone()
-        if existing:
-            return existing["id"]
-        cur = conn.execute(
-            "INSERT INTO security_alerts (case_id, officer_id, transaction_id, customer_id, amount_usd, threshold_usd, alert_type, triggered_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            (case_id, officer_id, transaction_id, customer_id, float(amount_usd), float(threshold_usd), alert_type, _now()),
-        )
-        return cur.lastrowid
-
-
-def list_security_alerts(officer_id=None, limit=100):
-    """Return newest threshold alerts, optionally limited to one officer."""
-    with get_conn() as conn:
-        if officer_id:
-            rows = conn.execute(
-                "SELECT * FROM security_alerts WHERE officer_id = ? ORDER BY triggered_at DESC, id DESC LIMIT ?",
-                (officer_id, int(limit)),
-            ).fetchall()
-        else:
-            rows = conn.execute(
-                "SELECT * FROM security_alerts ORDER BY triggered_at DESC, id DESC LIMIT ?",
-                (int(limit),),
-            ).fetchall()
-    return [dict(r) for r in rows]
-
-
-def acknowledge_security_alert(alert_id, officer_id, officer_name):
-    """Acknowledge an alert and record the acknowledgement in the audit log."""
-    with get_conn() as conn:
-        row = conn.execute("SELECT * FROM security_alerts WHERE id = ?", (alert_id,)).fetchone()
-        if row is None:
-            return False, "Security alert not found."
-        if row["acknowledged_by"]:
-            return False, "This security alert has already been acknowledged."
-        conn.execute(
-            "UPDATE security_alerts SET acknowledged_by = ?, acknowledged_at = ? WHERE id = ?",
-            (officer_id, _now(), alert_id),
-        )
-    append_audit(
-        row["case_id"], officer_id, officer_name, "SECURITY ALERT ACKNOWLEDGED",
-        decision=f"{row['transaction_id']}: {row['alert_type']} - USD {row['amount_usd']:,.2f} >= USD {row['threshold_usd']:,.2f}"
-    )
-    return True, "Security alert acknowledged."
 
 # ---------------------------------------------------------------------------
 # TWO-PERSON SIGN-OFF (maker-checker) for High/Critical risk escalations.
@@ -326,35 +273,46 @@ def acknowledge_security_alert(alert_id, officer_id, officer_name):
 # takes over exactly as it does for a single-signature case.
 # ---------------------------------------------------------------------------
 
-def submit_for_cosign(case_id, officer_id, officer_name, cosign_requirements: dict):
+def submit_for_cosign(case_id, officer_id, officer_name, officer_role, cosign_requirements: dict):
     """
     Marks a case as awaiting second sign-off instead of completing it
-    outright. `cosign_requirements`: {transaction_id: {...any case-specific
-    detail worth keeping, e.g. "risk_bucket", "decision", "amount_usd"}}
-    for each transaction that requires a second signature. Each entry is
-    stamped with the first officer's identity and timestamp here.
+    outright. `cosign_requirements`: {transaction_id: {..., "assigned_officer_id":
+    <officer_id or None>}} for each transaction that requires a second
+    signature. `assigned_officer_id` directs the request to one specific
+    officer (e.g. a named senior colleague the first officer chose); if
+    None, the request stays open to any officer with a qualifying role -
+    app.py enforces which of the two applies when filtering the queue.
+    Each entry is stamped with the first officer's identity, role, and
+    timestamp here, so the eventual SAR filing report can show exactly
+    who made each decision without a later lookup.
     """
     now = _now()
     stamped = {
         tid: {
             **details,
             "first_officer_id": officer_id, "first_officer_name": officer_name,
-            "first_signed_at": now,
-            "second_officer_id": None, "second_officer_name": None, "second_signed_at": None,
+            "first_officer_role": officer_role, "first_signed_at": now,
+            "second_officer_id": None, "second_officer_name": None,
+            "second_officer_role": None, "second_signed_at": None,
         }
         for tid, details in cosign_requirements.items()
     }
     save_case(case_id, officer_id, cosign_json=stamped, workflow_node="pending_cosign", status="pending_cosign")
+    assigned_names = [d.get("assigned_officer_name") for d in cosign_requirements.values() if d.get("assigned_officer_name")]
+    routing_note = f" (routed to {', '.join(assigned_names)})" if assigned_names else " (open to any qualifying officer)"
     append_audit(case_id, officer_id, officer_name, "SUBMIT FOR SECOND SIGN-OFF",
                  previous_status="in_progress", new_status="pending_cosign",
-                 decision=f"{len(cosign_requirements)} transaction(s) require a second signature")
+                 decision=f"{len(cosign_requirements)} transaction(s) require a second signature{routing_note}")
 
 
 def list_pending_cosign(exclude_officer_id):
     """Cases awaiting a second officer's co-signature, excluding cases
     originated by exclude_officer_id - an officer can never see their own
     escalation in a queue meant for approving someone else's decision
-    (also re-enforced inside record_second_signature as a hard check)."""
+    (also re-enforced inside record_second_signature as a hard check).
+    Returns EVERY pending case regardless of routing - app.py filters each
+    case's individual transaction entries by assigned_officer_id (None =
+    open to anyone eligible, or a specific officer_id = directed)."""
     with get_conn() as conn:
         rows = conn.execute(
             "SELECT case_id, officer_id, risk_summary, cosign_json, updated_at FROM cases "
@@ -369,15 +327,16 @@ def list_pending_cosign(exclude_officer_id):
     return results
 
 
-def record_second_signature(case_id, transaction_id, second_officer_id, second_officer_name):
+def record_second_signature(case_id, transaction_id, second_officer_id, second_officer_name, second_officer_role):
     """
     Records a second officer's co-signature for one transaction in a case
     awaiting sign-off. Refuses if the second officer is the same as the
-    first (no self-approval) or if this transaction was already
-    co-signed. Once every transaction in the case's cosign record has a
-    second signature, the case is automatically marked 'completed', at
-    which point save_case()'s normal lock protects it exactly like any
-    other completed case.
+    first (no self-approval), if this transaction was already co-signed,
+    or if the request was directed to a specific officer and this is not
+    them. Once every transaction in the case's cosign record has a second
+    signature, the case is automatically marked 'completed', at which
+    point save_case()'s normal lock protects it exactly like any other
+    completed case.
 
     Returns (success: bool, message: str).
     """
@@ -395,9 +354,13 @@ def record_second_signature(case_id, transaction_id, second_officer_id, second_o
         return False, "The officer who escalated this transaction cannot also provide the second sign-off."
     if entry.get("second_officer_id"):
         return False, "This transaction already has a second signature recorded."
+    assigned = entry.get("assigned_officer_id")
+    if assigned and assigned != second_officer_id:
+        return False, "This escalation was routed to a specific officer and cannot be co-signed by anyone else."
 
     entry["second_officer_id"] = second_officer_id
     entry["second_officer_name"] = second_officer_name
+    entry["second_officer_role"] = second_officer_role
     entry["second_signed_at"] = _now()
     cosign[transaction_id] = entry
 
