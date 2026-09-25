@@ -979,6 +979,11 @@ if st.session_state.pipeline_status in ("awaiting_review", "complete"):
         alert_ids = st.session_state.pending_sound_alert
         st.session_state.pending_sound_alert = None  # consume immediately - never replays on a later rerun
         st.warning(f"\U0001F6A8 {len(alert_ids)} transaction(s) triggered an AML rule and require review: {', '.join(alert_ids)}")
+
+        high_risk_ids = [t["transaction_id"] for t in valid_txns if t.get("transaction_id") in alert_ids and t.get("risk_bucket") == "High"]
+        if high_risk_ids:
+            st.error(f"\u26A0\uFE0F **HIGH RISK: {len(high_risk_ids)} transaction(s) require immediate attention: {', '.join(high_risk_ids)}**")
+
         st.markdown(audio_alert.alert_audio_html(audio_alert.generate_alert_tone()), unsafe_allow_html=True)
 
     m1, m2, m3 = st.columns(3)
@@ -1003,7 +1008,7 @@ if st.session_state.pipeline_status in ("awaiting_review", "complete"):
 
         decisions = {}
         for txn in st.session_state.pending_transactions:
-            badge = "\U0001F534" if txn["risk_bucket"] == "High" else "\U0001F7E0"
+            badge = "\u26A0\uFE0F\U0001F534" if txn["risk_bucket"] == "High" else "\U0001F7E0"
             oc = txn.get("original_currency", "USD")
             oa = txn.get("original_amount", txn.get("amount"))
             with st.container(border=True):
