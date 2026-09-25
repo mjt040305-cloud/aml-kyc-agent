@@ -767,9 +767,30 @@ required_cols = {
 }
 
 if uploaded_file is not None:
+    # Detect a genuinely NEW upload (not just this same file persisting
+    # across an unrelated Streamlit rerun, e.g. typing a review note) by
+    # tracking its unique file_id. Without this, every rerun would either
+    # wrongly wipe state on unrelated interactions, or - the bug this is
+    # fixing - a real new upload would silently keep showing stale
+    # results (including a stale "case fully closed" message) from
+    # whatever the PREVIOUS uploaded file's analysis produced.
+    is_new_upload = st.session_state.get("last_loaded_file_id") != uploaded_file.file_id
     st.session_state.raw_df = pd.read_csv(uploaded_file)
+    if is_new_upload:
+        st.session_state.last_loaded_file_id = uploaded_file.file_id
+        st.session_state.pipeline_status = None
+        st.session_state.case_id = None
+        st.session_state.final_report = None
+        st.session_state.pending_transactions = []
+        st.session_state.audit_trail = []
 elif use_sample:
     st.session_state.raw_df = pd.read_csv("sample_transactions.csv")
+    st.session_state.last_loaded_file_id = "__sample__"
+    st.session_state.pipeline_status = None
+    st.session_state.case_id = None
+    st.session_state.final_report = None
+    st.session_state.pending_transactions = []
+    st.session_state.audit_trail = []
 
 raw_df = st.session_state.raw_df
 
